@@ -316,8 +316,10 @@ fn source_component(
         properties.push(property("flatpak:skip-arches", arches.join(",")));
     }
 
+    let purl = infer_purl(source);
+
     Component {
-        component_type: "file".to_string(),
+        component_type: if purl.is_some() { "library" } else { "file" }.to_string(),
         name: name.to_string(),
         bom_ref: format!(
             "flatpak:{}@{}#module={}:source={}",
@@ -331,7 +333,7 @@ fn source_component(
             .clone()
             .or_else(|| source.commit.clone())
             .or_else(|| source.branch.clone()),
-        purl: infer_purl(source),
+        purl,
         external_references: source
             .url
             .as_ref()
@@ -385,7 +387,21 @@ fn infer_purl(source: &Source) -> Option<String> {
             .trim_start_matches("https://github.com/")
             .trim_end_matches(".git");
         if path.split('/').count() == 2 {
+            if let Some(version) = source
+                .tag
+                .as_deref()
+                .or(source.commit.as_deref())
+                .and_then(normalize_git_version)
+            {
+                return Some(format!("pkg:github/{path}@{version}"));
+            }
             return Some(format!("pkg:github/{}", path));
+        }
+    }
+
+    if url.starts_with("https://github.com/") || url.starts_with("https://codeload.github.com/") {
+        if let Some(purl) = infer_github_release_purl(url) {
+            return Some(purl);
         }
     }
 
@@ -408,6 +424,54 @@ fn infer_purl(source: &Source) -> Option<String> {
     }
 
     None
+}
+
+fn infer_github_release_purl(url: &str) -> Option<String> {
+    let path = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("https://codeload.github.com/"))?;
+    let parts = path.split('/').collect::<Vec<_>>();
+    let [owner, repo, rest @ ..] = parts.as_slice() else {
+        return None;
+    };
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+
+    let version = match rest {
+        ["archive", "refs", "tags", tag_file, ..] => strip_archive_extension(tag_file),
+        ["releases", "download", tag, ..] => Some((*tag).to_string()),
+        ["tar.gz", "refs", "tags", tag, ..] => Some((*tag).to_string()),
+        ["zip", "refs", "tags", tag, ..] => Some((*tag).to_string()),
+        _ => None,
+    }?;
+
+    if version.is_empty() {
+        return None;
+    }
+
+    Some(format!("pkg:github/{owner}/{repo}@{version}"))
+}
+
+fn normalize_git_version(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    if let Some((tag, _commit)) = value.split_once("-0-g") {
+        if !tag.is_empty() {
+            return Some(tag.to_string());
+        }
+    }
+
+    Some(value.to_string())
+}
+
+fn strip_archive_extension(filename: &str) -> Option<String> {
+    [".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".zip"]
+        .iter()
+        .find_map(|suffix| filename.strip_suffix(suffix))
+        .map(str::to_string)
 }
 
 fn infer_pypi_wheel_purl(url: &str) -> Option<String> {
@@ -527,7 +591,7 @@ mod tests {
         let reader = FixtureReader {
             files: BTreeMap::from([
                 ((app_ref.to_string(), "metadata".to_string()), b"[Application]\nruntime=org.gnome.Platform/x86_64/46\n".to_vec()),
-                ((app_ref.to_string(), "files/manifest.json".to_string()), br#"{"modules":[{"name":"zlib","sources":[{"type":"git","url":"https://github.com/madler/zlib.git","commit":"abc"}]}]}"#.to_vec()),
+                ((app_ref.to_string(), "files/manifest.json".to_string()), br#"{"modules":[{"name":"zlib","sources":[{"type":"git","url":"https://github.com/madler/zlib.git","tag":"v1.3.1"}]}]}"#.to_vec()),
                 ((runtime_ref.to_string(), "metadata".to_string()), b"[Runtime]\n".to_vec()),
                 ((runtime_ref.to_string(), "files/manifest.json".to_string()), br#"{"modules":[{"name":"openssl","sources":[{"type":"archive","url":"https://example.test/openssl.tar.gz","sha256":"def"}]}]}"#.to_vec()),
             ]),
@@ -544,7 +608,11 @@ mod tests {
         assert!(bom
             .components
             .iter()
-            .any(|component| component.purl.as_deref() == Some("pkg:github/madler/zlib")));
+            .any(|component| component.purl.as_deref() == Some("pkg:github/madler/zlib@v1.3.1")));
+        assert!(bom.components.iter().any(|component| {
+            component.purl.as_deref() == Some("pkg:github/madler/zlib@v1.3.1")
+                && component.component_type == "library"
+        }));
 
         let json = serde_json::to_value(&bom).unwrap();
         assert!(json["dependencies"][0].get("dependsOn").is_some());
@@ -598,6 +666,62 @@ mod tests {
             )
             .as_deref(),
             Some("pkg:pypi/my-package@1.2.3")
+        );
+    }
+
+    #[test]
+    fn infers_github_purl_from_tag_archive() {
+        assert_eq!(
+            infer_github_release_purl(
+                "https://github.com/owner/project/archive/refs/tags/v1.2.3.tar.gz"
+            )
+            .as_deref(),
+            Some("pkg:github/owner/project@v1.2.3")
+        );
+    }
+
+    #[test]
+    fn infers_github_purl_from_release_asset() {
+        assert_eq!(
+            infer_github_release_purl(
+                "https://github.com/owner/project/releases/download/v1.2.3/project-linux.tar.gz"
+            )
+            .as_deref(),
+            Some("pkg:github/owner/project@v1.2.3")
+        );
+    }
+
+    #[test]
+    fn infers_github_purl_from_codeload_archive() {
+        assert_eq!(
+            infer_github_release_purl(
+                "https://codeload.github.com/owner/project/tar.gz/refs/tags/v1.2.3"
+            )
+            .as_deref(),
+            Some("pkg:github/owner/project@v1.2.3")
+        );
+    }
+
+    #[test]
+    fn infers_versioned_github_git_purl_from_tag() {
+        let source = Source {
+            source_type: Some("git".to_string()),
+            url: Some("https://github.com/madler/zlib.git".to_string()),
+            tag: Some("v1.3.1".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            infer_purl(&source).as_deref(),
+            Some("pkg:github/madler/zlib@v1.3.1")
+        );
+    }
+
+    #[test]
+    fn normalizes_exact_git_describe_version() {
+        assert_eq!(
+            normalize_git_version("v1.3.1-0-g51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf").as_deref(),
+            Some("v1.3.1")
         );
     }
 

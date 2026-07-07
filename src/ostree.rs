@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 use tempfile::TempDir;
 
 pub trait OstreeFileReader {
@@ -13,22 +15,32 @@ pub trait OstreeFileReader {
 }
 
 #[derive(Debug, Default)]
-pub struct CliOstreeFileReader;
+pub struct CliOstreeFileReader {
+    repo: Mutex<Option<CachedRepo>>,
+}
+
+#[derive(Debug)]
+struct CachedRepo {
+    _tempdir: TempDir,
+    repo_url: String,
+    path: PathBuf,
+}
 
 impl CliOstreeFileReader {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
-    fn prepare_repo(
-        &self,
-        repo_url: &str,
-        ref_name: &str,
-        subpath: Option<&str>,
-    ) -> Result<TempDir> {
-        let tempdir = tempfile::tempdir().context("create temporary OSTree repository")?;
-        let repo = tempdir.path();
+    fn ensure_repo(&self, repo_url: &str) -> Result<PathBuf> {
+        let mut cached = self.repo.lock().expect("OSTree repo cache poisoned");
+        if let Some(cached_repo) = cached.as_ref() {
+            if cached_repo.repo_url == repo_url {
+                return Ok(cached_repo.path.clone());
+            }
+        }
 
+        let tempdir = tempfile::tempdir().context("create temporary OSTree repository")?;
+        let repo = tempdir.path().to_path_buf();
         run(Command::new("ostree")
             .arg(format!("--repo={}", repo.display()))
             .arg("init")
@@ -41,6 +53,17 @@ impl CliOstreeFileReader {
             .arg("origin")
             .arg(repo_url))?;
 
+        *cached = Some(CachedRepo {
+            _tempdir: tempdir,
+            repo_url: repo_url.to_string(),
+            path: repo.clone(),
+        });
+
+        Ok(repo)
+    }
+
+    fn pull_ref(&self, repo_url: &str, ref_name: &str, subpath: Option<&str>) -> Result<PathBuf> {
+        let repo = self.ensure_repo(repo_url)?;
         let mut pull = Command::new("ostree");
         pull.arg(format!("--repo={}", repo.display()))
             .arg("pull")
@@ -51,7 +74,7 @@ impl CliOstreeFileReader {
         pull.arg("origin").arg(ref_name);
         run(&mut pull)?;
 
-        Ok(tempdir)
+        Ok(repo)
     }
 }
 
@@ -62,8 +85,7 @@ impl OstreeFileReader for CliOstreeFileReader {
         ref_name: &str,
         path: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let tempdir = self.prepare_repo(repo_url, ref_name, Some(path))?;
-        let repo = tempdir.path();
+        let repo = self.pull_ref(repo_url, ref_name, Some(path))?;
         let normalized = path.trim_start_matches('/');
         let output = Command::new("ostree")
             .arg(format!("--repo={}", repo.display()))
@@ -86,8 +108,7 @@ impl OstreeFileReader for CliOstreeFileReader {
     }
 
     fn resolve_ref(&self, repo_url: &str, ref_name: &str) -> Result<String> {
-        let tempdir = self.prepare_repo(repo_url, ref_name, None)?;
-        let repo = tempdir.path();
+        let repo = self.pull_ref(repo_url, ref_name, None)?;
         let output = Command::new("ostree")
             .arg(format!("--repo={}", repo.display()))
             .arg("rev-parse")
