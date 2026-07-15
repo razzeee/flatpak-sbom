@@ -43,6 +43,12 @@ impl FlatpakMetadata {
         self.get("Application", "runtime")
     }
 
+    pub fn groups(&self) -> impl Iterator<Item = (&str, &BTreeMap<String, String>)> {
+        self.groups
+            .iter()
+            .map(|(name, values)| (name.as_str(), values))
+    }
+
     pub fn extension_groups(&self) -> impl Iterator<Item = (&str, &BTreeMap<String, String>)> {
         self.groups.iter().filter_map(|(name, values)| {
             if name.starts_with("Extension ") || name.starts_with("ExtensionOf ") {
@@ -72,5 +78,13 @@ mod tests {
             FlatpakMetadata::parse("[Extension org.example.Codecs]\ndirectory=lib/codecs\n")
                 .unwrap();
         assert_eq!(metadata.extension_groups().count(), 1);
+    }
+
+    #[test]
+    fn exposes_groups_in_sorted_order() {
+        let metadata = FlatpakMetadata::parse("[B]\ny=2\n[A]\nx=1\n").unwrap();
+        let groups = metadata.groups().map(|(name, _)| name).collect::<Vec<_>>();
+
+        assert_eq!(groups, vec!["A", "B"]);
     }
 }

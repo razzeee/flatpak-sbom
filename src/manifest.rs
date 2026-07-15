@@ -7,9 +7,14 @@ use std::collections::BTreeMap;
 pub struct FlatpakManifest {
     pub id: Option<String>,
     pub app_id: Option<String>,
+    pub license: Option<String>,
+    pub command: Option<String>,
     pub runtime: Option<String>,
     pub runtime_version: Option<String>,
     pub sdk: Option<String>,
+    pub finish_args: Option<Vec<String>>,
+    pub cleanup: Option<Vec<String>>,
+    pub cleanup_commands: Option<Vec<String>>,
     #[serde(default)]
     pub modules: Vec<Module>,
     #[serde(flatten)]
@@ -19,7 +24,7 @@ pub struct FlatpakManifest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Module {
-    Object(ModuleObject),
+    Object(Box<ModuleObject>),
     Name(String),
 }
 
@@ -35,6 +40,76 @@ impl Module {
         match self {
             Self::Object(module) => &module.sources,
             Self::Name(_) => &[],
+        }
+    }
+
+    pub fn modules(&self) -> &[Module] {
+        match self {
+            Self::Object(module) => &module.modules,
+            Self::Name(_) => &[],
+        }
+    }
+
+    pub fn license(&self) -> Option<&str> {
+        match self {
+            Self::Object(module) => module.license.as_deref(),
+            Self::Name(_) => None,
+        }
+    }
+
+    pub fn buildsystem(&self) -> Option<&str> {
+        match self {
+            Self::Object(module) => module.buildsystem.as_deref(),
+            Self::Name(_) => None,
+        }
+    }
+
+    pub fn builddir(&self) -> Option<&str> {
+        match self {
+            Self::Object(module) => module.builddir.as_deref(),
+            Self::Name(_) => None,
+        }
+    }
+
+    pub fn subdir(&self) -> Option<&str> {
+        match self {
+            Self::Object(module) => module.subdir.as_deref(),
+            Self::Name(_) => None,
+        }
+    }
+
+    pub fn config_opts(&self) -> Option<&[String]> {
+        match self {
+            Self::Object(module) => module.config_opts.as_deref(),
+            Self::Name(_) => None,
+        }
+    }
+
+    pub fn cleanup(&self) -> Option<&[String]> {
+        match self {
+            Self::Object(module) => module.cleanup.as_deref(),
+            Self::Name(_) => None,
+        }
+    }
+
+    pub fn cleanup_commands(&self) -> Option<&[String]> {
+        match self {
+            Self::Object(module) => module.cleanup_commands.as_deref(),
+            Self::Name(_) => None,
+        }
+    }
+
+    pub fn post_install(&self) -> Option<&[String]> {
+        match self {
+            Self::Object(module) => module.post_install.as_deref(),
+            Self::Name(_) => None,
+        }
+    }
+
+    pub fn extra(&self) -> Option<&BTreeMap<String, Value>> {
+        match self {
+            Self::Object(module) => Some(&module.extra),
+            Self::Name(_) => None,
         }
     }
 
@@ -54,10 +129,20 @@ impl Module {
 #[serde(rename_all = "kebab-case")]
 pub struct ModuleObject {
     pub name: Option<String>,
+    pub license: Option<String>,
+    pub buildsystem: Option<String>,
+    pub builddir: Option<String>,
+    pub subdir: Option<String>,
+    pub config_opts: Option<Vec<String>>,
+    pub cleanup: Option<Vec<String>>,
+    pub cleanup_commands: Option<Vec<String>>,
+    pub post_install: Option<Vec<String>>,
     pub only_arches: Option<Vec<String>>,
     pub skip_arches: Option<Vec<String>>,
     #[serde(default)]
     pub sources: Vec<Source>,
+    #[serde(default)]
+    pub modules: Vec<Module>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -69,9 +154,18 @@ pub struct Source {
     pub source_type: Option<String>,
     pub path: Option<String>,
     pub url: Option<String>,
+    pub urls: Option<Vec<String>>,
+    pub mirror_urls: Option<Vec<String>>,
+    pub sha512: Option<String>,
     pub sha256: Option<String>,
+    pub sha1: Option<String>,
+    pub md5: Option<String>,
     pub size: Option<u64>,
+    pub dest: Option<String>,
     pub dest_filename: Option<String>,
+    pub strip_components: Option<u64>,
+    pub git_submodules: Option<bool>,
+    pub disable_shallow_clone: Option<bool>,
     pub only_arches: Option<Vec<String>>,
     pub skip_arches: Option<Vec<String>>,
     pub commit: Option<String>,
@@ -148,5 +242,14 @@ mod tests {
         assert!(!manifest.modules[0].applies_to_arch("aarch64"));
         assert!(manifest.modules[0].sources()[0].applies_to_arch("x86_64"));
         assert!(!manifest.modules[0].sources()[0].applies_to_arch("aarch64"));
+    }
+
+    #[test]
+    fn parses_nested_modules() {
+        let manifest: FlatpakManifest =
+            serde_json::from_str(r#"{"modules":[{"name":"parent","modules":[{"name":"child"}]}]}"#)
+                .unwrap();
+
+        assert_eq!(manifest.modules[0].modules()[0].name(), "child");
     }
 }

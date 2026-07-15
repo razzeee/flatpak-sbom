@@ -130,6 +130,7 @@ fn scan(reader: &impl ostree::OstreeFileReader, args: ScanArgs) -> Result<()> {
 
 fn make_grype_compatible(document: &mut cyclonedx::Bom) {
     // Grype/Syft v1.40 rejects CycloneDX 1.7 JSON, but accepts the fields we emit as 1.6.
+    document.schema = "https://cyclonedx.org/schema/bom-1.6.schema.json".to_string();
     document.spec_version = "1.6".to_string();
 }
 
@@ -162,10 +163,15 @@ mod tests {
     #[test]
     fn grype_compatibility_downgrades_cyclonedx_version() {
         let mut document = cyclonedx::Bom {
+            schema: "https://cyclonedx.org/schema/bom-1.7.schema.json".to_string(),
             bom_format: "CycloneDX".to_string(),
             spec_version: "1.7".to_string(),
+            serial_number: "urn:uuid:00000000-0000-0000-0000-000000000000".to_string(),
             version: 1,
             metadata: cyclonedx::Metadata {
+                timestamp: None,
+                lifecycles: vec![],
+                tools: None,
                 component: cyclonedx::Component {
                     component_type: "application".to_string(),
                     name: "test".to_string(),
@@ -173,6 +179,9 @@ mod tests {
                     version: None,
                     purl: None,
                     external_references: vec![],
+                    hashes: vec![],
+                    licenses: vec![],
+                    evidence: None,
                     properties: vec![],
                 },
             },
@@ -182,6 +191,10 @@ mod tests {
         };
 
         make_grype_compatible(&mut document);
+        assert_eq!(
+            document.schema,
+            "https://cyclonedx.org/schema/bom-1.6.schema.json"
+        );
         assert_eq!(document.spec_version, "1.6");
     }
 }
