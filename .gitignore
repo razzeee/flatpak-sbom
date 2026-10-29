@@ -2,3 +2,5 @@
 *.cdx.json
 *-grype.json
 *-report.json
+/.venv/
+__pycache__/

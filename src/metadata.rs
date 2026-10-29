@@ -51,7 +51,7 @@ impl FlatpakMetadata {
 
     pub fn extension_groups(&self) -> impl Iterator<Item = (&str, &BTreeMap<String, String>)> {
         self.groups.iter().filter_map(|(name, values)| {
-            if name.starts_with("Extension ") || name.starts_with("ExtensionOf ") {
+            if name.starts_with("Extension ") {
                 Some((name.as_str(), values))
             } else {
                 None
@@ -78,6 +78,15 @@ mod tests {
             FlatpakMetadata::parse("[Extension org.example.Codecs]\ndirectory=lib/codecs\n")
                 .unwrap();
         assert_eq!(metadata.extension_groups().count(), 1);
+    }
+
+    #[test]
+    fn extension_of_is_not_an_extension_point() {
+        let metadata = FlatpakMetadata::parse(
+            "[ExtensionOf]\nref=runtime/org.example.Platform/x86_64/stable\n[Extension org.example.Locale]\ndirectory=share/locale\n",
+        ).unwrap();
+        let names: Vec<_> = metadata.extension_groups().map(|(name, _)| name).collect();
+        assert_eq!(names, ["Extension org.example.Locale"]);
     }
 
     #[test]

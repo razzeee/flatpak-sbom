@@ -31,8 +31,6 @@ pub struct Metadata {
 #[derive(Debug, Serialize)]
 pub struct Lifecycle {
     pub phase: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +50,8 @@ pub struct Component {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub purl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpe: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub external_references: Vec<ExternalReference>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -124,8 +124,6 @@ pub struct Dependency {
 pub struct Composition {
     pub aggregate: String,
     pub assemblies: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub properties: Vec<Property>,
 }
 
 pub fn property(name: impl Into<String>, value: impl Into<String>) -> Property {
