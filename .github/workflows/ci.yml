@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      live_content:
+        description: Also download and scan full Flathub app/runtime contents
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,3 +39,63 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
+
+  acceptance:
+    name: OSTree and scanner acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ostree python3-venv gcc
+          python3 -m venv .venv
+          .venv/bin/pip install jsonschema==4.26.0
+      - name: Install pinned Grype
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/grype"
+          cd "$RUNNER_TEMP/grype"
+          gh release download v0.121.0 --repo anchore/grype --pattern grype_0.121.0_linux_amd64.tar.gz --pattern grype_0.121.0_checksums.txt
+          sha256sum --check --ignore-missing grype_0.121.0_checksums.txt
+          tar -xzf grype_0.121.0_linux_amd64.tar.gz grype
+          echo "$RUNNER_TEMP/grype" >> "$GITHUB_PATH"
+      - name: Build and verify repository consistency
+        run: |
+          cargo build --locked
+          cargo test --locked real_repository_update -- --ignored
+      - name: Install pinned Syft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/syft"
+          cd "$RUNNER_TEMP/syft"
+          gh release download v1.55.0 --repo anchore/syft --pattern syft_1.55.0_linux_amd64.tar.gz --pattern syft_1.55.0_checksums.txt
+          sha256sum --check --ignore-missing syft_1.55.0_checksums.txt
+          tar -xzf syft_1.55.0_linux_amd64.tar.gz syft
+          echo "$RUNNER_TEMP/syft" >> "$GITHUB_PATH"
+      - name: Prepare vulnerability database
+        run: grype db update
+      - name: Validate schemas and real scanner round-trip
+        env:
+          TEST_GRYPE: '1'
+          TEST_SYFT: '1'
+          GRYPE_DB_AUTO_UPDATE: 'false'
+        run: .venv/bin/python tests/acceptance.py
+      - name: Live Flathub release gate
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TEST_FLATHUB: '1'
+          TEST_FLATHUB_CONTENT: ${{ inputs.live_content && '1' || '0' }}
+          ACCEPTANCE_TIMEOUT: '600'
+        run: .venv/bin/python tests/acceptance.py
+      - name: Preserve live SBOM evidence
+        if: always() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-flathub-sboms
+          path: target/acceptance/

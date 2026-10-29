@@ -64,9 +64,9 @@ impl Module {
         }
     }
 
-    pub fn builddir(&self) -> Option<&str> {
+    pub fn builddir(&self) -> Option<bool> {
         match self {
-            Self::Object(module) => module.builddir.as_deref(),
+            Self::Object(module) => module.builddir,
             Self::Name(_) => None,
         }
     }
@@ -131,7 +131,7 @@ pub struct ModuleObject {
     pub name: Option<String>,
     pub license: Option<String>,
     pub buildsystem: Option<String>,
-    pub builddir: Option<String>,
+    pub builddir: Option<bool>,
     pub subdir: Option<String>,
     pub config_opts: Option<Vec<String>>,
     pub cleanup: Option<Vec<String>>,

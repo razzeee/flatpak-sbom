@@ -65,6 +65,9 @@ pub fn generate_for_app(
         property("flatpak:ref", app_ref.as_str()),
         property("flatpak:commit", app_commit.clone()),
         property("flatpak:inventory-kind", "manifest-derived"),
+        property("flatpak:composition-reason", "Manifest-derived metadata does not enumerate package contents inside source archives, vendored trees, or binary extra-data payloads"),
+        property("flatpak:composition-coverage", "app-and-runtime-manifests"),
+        property("flatpak:composition-runtime-ref", runtime_ref.as_str()),
     ];
     push_optional(
         &mut root_properties,
@@ -122,8 +125,35 @@ pub fn generate_for_app(
             extension_group_count.to_string(),
         ));
     }
+    for (scope, metadata, reference, commit) in [
+        ("app", &app_metadata, app_ref.as_str(), &app_commit),
+        (
+            "runtime",
+            &runtime_metadata,
+            runtime_ref.as_str(),
+            &runtime_commit,
+        ),
+    ] {
+        let declarations: Vec<_> = metadata
+            .extension_groups()
+            .map(|(group, fields)| {
+                serde_json::json!({
+                    "name": group.strip_prefix("Extension ").unwrap(),
+                    "parent_ref": reference,
+                    "parent_commit": commit,
+                    "metadata": fields,
+                    "status": "not-inventoried"
+                })
+            })
+            .collect();
+        root_properties.push(property(
+            format!("flatpak:extension-declarations:{scope}"),
+            serde_json::to_string(&declarations)?,
+        ));
+    }
 
     let root = Component {
+        cpe: None,
         component_type: "application".to_string(),
         name: app_ref.id.clone(),
         bom_ref: root_ref.clone(),
@@ -225,13 +255,10 @@ pub fn generate_for_app(
             ),
             lifecycles: vec![Lifecycle {
                 phase: "build".to_string(),
-                description: Some(
-                    "Manifest-derived SBOM generated from Flatpak OSTree metadata and manifests"
-                        .to_string(),
-                ),
             }],
             tools: Some(Tools {
                 components: vec![Component {
+                    cpe: None,
                     component_type: "application".to_string(),
                     name: "flatpak-sbom".to_string(),
                     bom_ref: format!("pkg:cargo/flatpak-sbom@{}", env!("CARGO_PKG_VERSION")),
@@ -254,14 +281,6 @@ pub fn generate_for_app(
         compositions: vec![Composition {
             aggregate: "incomplete".to_string(),
             assemblies,
-            properties: vec![
-                property(
-                    "flatpak:composition-reason",
-                    "Manifest-derived metadata does not enumerate package contents inside source archives, vendored trees, or binary extra-data payloads",
-                ),
-                property("flatpak:composition-coverage", "app-and-runtime-manifests"),
-                property("flatpak:composition-runtime-ref", runtime_ref.as_str()),
-            ],
         }],
     })
 }
@@ -338,6 +357,7 @@ fn artifact_component(
     );
 
     Component {
+        cpe: None,
         component_type: if context.scope == "app" {
             "application"
         } else {
@@ -381,7 +401,7 @@ fn manifest_components(
     let mut components = Vec::new();
     let mut modules = Vec::new();
     let mut dependencies = Vec::new();
-    for module in &manifest.modules {
+    for (index, module) in manifest.modules.iter().enumerate() {
         if !module.applies_to_arch(&context.flatpak_ref.arch) {
             continue;
         }
@@ -390,6 +410,7 @@ fn manifest_components(
             context,
             module,
             &[module.name().to_string()],
+            &index.to_string(),
             &mut components,
             &mut dependencies,
         );
@@ -406,6 +427,7 @@ fn collect_module_components(
     context: ComponentContext<'_>,
     module: &crate::manifest::Module,
     module_path: &[String],
+    identity_path: &str,
     components: &mut Vec<Component>,
     dependencies: &mut Vec<Dependency>,
 ) -> Component {
@@ -421,11 +443,9 @@ fn collect_module_components(
         "flatpak:module-buildsystem",
         module.buildsystem(),
     );
-    push_optional(
-        &mut module_properties,
-        "flatpak:module-builddir",
-        module.builddir(),
-    );
+    if let Some(builddir) = module.builddir() {
+        module_properties.push(property("flatpak:module-builddir", builddir.to_string()));
+    }
     push_optional(
         &mut module_properties,
         "flatpak:module-subdir",
@@ -457,9 +477,10 @@ fn collect_module_components(
     }
 
     let module_component = Component {
+        cpe: None,
         component_type: "library".to_string(),
         name: module_name.to_string(),
-        bom_ref: module_bom_ref(context, &module_path_string),
+        bom_ref: module_bom_ref(context, identity_path),
         version: None,
         purl: None,
         external_references: vec![],
@@ -477,14 +498,20 @@ fn collect_module_components(
     components.push(module_component.clone());
 
     let mut depends_on = Vec::new();
-    for child in module.modules() {
+    for (index, child) in module.modules().iter().enumerate() {
         if !child.applies_to_arch(&context.flatpak_ref.arch) {
             continue;
         }
         let mut child_path = module_path.to_vec();
         child_path.push(child.name().to_string());
-        let child_component =
-            collect_module_components(context, child, &child_path, components, dependencies);
+        let child_component = collect_module_components(
+            context,
+            child,
+            &child_path,
+            &format!("{identity_path}/{index}"),
+            components,
+            dependencies,
+        );
         depends_on.push(child_component.bom_ref);
     }
 
@@ -494,8 +521,7 @@ fn collect_module_components(
         .enumerate()
         .filter(|(_, source)| source.applies_to_arch(&context.flatpak_ref.arch))
     {
-        let source_component =
-            source_component(context, module_name, &module_path_string, index, source);
+        let source_component = source_component(context, module_name, identity_path, index, source);
         depends_on.push(source_component.bom_ref.clone());
         dependencies.push(Dependency {
             bom_ref: source_component.bom_ref.clone(),
@@ -527,6 +553,7 @@ fn source_component(
         .unwrap_or(source_type);
     let mut properties = with_module(base_properties(context), module_name);
     properties.push(property("flatpak:source-type", source_type));
+    push_optional(&mut properties, "flatpak:source-url", source.url.as_deref());
     push_optional(
         &mut properties,
         "flatpak:source-sha512",
@@ -607,12 +634,41 @@ fn source_component(
     push_extra_properties(&mut properties, "flatpak:source-extra", &source.extra);
 
     let purl = infer_purl(source);
+    let archive_identity = source.url.as_deref().and_then(archive_identity);
+    let version_kind =
+        if purl.as_deref().is_some_and(|purl| purl.contains('@')) || source.tag.is_some() {
+            "release"
+        } else if source.commit.is_some() {
+            "git-commit"
+        } else if archive_identity.is_some() {
+            "filename"
+        } else {
+            "unknown"
+        };
+    properties.push(property("flatpak:version-kind", version_kind));
+    if let Some((_, version)) = &archive_identity {
+        properties.push(property("flatpak:filename-version-candidate", version));
+    }
+    let package = purl
+        .as_deref()
+        .and_then(|value| value.parse::<packageurl::PackageUrl>().ok());
     let hashes = source_hashes(source);
     let evidence = source_evidence(source, purl.as_deref(), name);
 
     Component {
-        component_type: if purl.is_some() { "library" } else { "file" }.to_string(),
-        name: name.to_string(),
+        component_type: if purl.is_some() || archive_identity.is_some() {
+            "library"
+        } else {
+            "file"
+        }
+        .to_string(),
+        cpe: None,
+        name: package
+            .as_ref()
+            .map(|package| package.name())
+            .or_else(|| archive_identity.as_ref().map(|(name, _)| name.as_str()))
+            .unwrap_or(name)
+            .to_string(),
         bom_ref: format!(
             "flatpak:{}@{}#module={}:source={}",
             context.flatpak_ref.as_str(),
@@ -620,11 +676,17 @@ fn source_component(
             escape_ref(module_path),
             index
         ),
-        version: source
-            .tag
-            .clone()
-            .or_else(|| source.commit.clone())
-            .or_else(|| source.branch.clone()),
+        version: package
+            .as_ref()
+            .and_then(|package| package.version())
+            .map(str::to_string)
+            .or_else(|| {
+                source.tag.clone().or_else(|| {
+                    archive_identity
+                        .as_ref()
+                        .map(|(_, version)| version.clone())
+                })
+            }),
         purl,
         external_references: source_external_references(source),
         hashes,
@@ -701,7 +763,7 @@ fn push_extra_properties(
     }
 }
 
-fn push_metadata_properties(
+pub(crate) fn push_metadata_properties(
     properties: &mut Vec<crate::cyclonedx::Property>,
     metadata: &FlatpakMetadata,
 ) {
@@ -817,7 +879,7 @@ fn source_evidence(source: &Source, purl: Option<&str>, fallback_name: &str) -> 
     }
     if let Some(url) = source.url.as_deref() {
         return Some(component_evidence(
-            "url",
+            "name",
             url.to_string(),
             "Flatpak manifest source URL",
             0.6,
@@ -825,7 +887,7 @@ fn source_evidence(source: &Source, purl: Option<&str>, fallback_name: &str) -> 
     }
     if let Some(path) = source.path.as_deref() {
         return Some(component_evidence(
-            "path",
+            "name",
             path.to_string(),
             "Flatpak manifest local source path",
             0.6,
@@ -845,9 +907,9 @@ fn component_evidence(field: &str, value: String, technique: &str, confidence: f
             field: field.to_string(),
             confidence,
             methods: vec![EvidenceIdentityMethod {
-                technique: technique.to_string(),
+                technique: "manifest-analysis".to_string(),
                 confidence,
-                value,
+                value: format!("{technique}: {value}"),
             }],
         }),
     }
@@ -879,10 +941,13 @@ fn infer_purl(source: &Source) -> Option<String> {
     }
 
     if url.starts_with("https://files.pythonhosted.org/") {
-        return infer_pypi_wheel_purl(url);
+        return infer_pypi_wheel_purl(url).or_else(|| {
+            let (name, version) = archive_identity(url)?;
+            Some(format!("pkg:pypi/{}@{version}", normalize_pypi_name(&name)))
+        });
     }
 
-    if url.starts_with("https://static.crates.io/crates/") || url.contains("/crates/") {
+    if url.starts_with("https://static.crates.io/crates/") {
         if let Some(purl) = infer_cargo_crate_purl(url) {
             return Some(purl);
         }
@@ -896,6 +961,53 @@ fn infer_purl(source: &Source) -> Option<String> {
         return infer_go_proxy_purl(url);
     }
 
+    None
+}
+
+// Filename evidence provides a candidate, not an ecosystem identity. In
+// particular, do not invent a PyPI/Cargo PURL for a generic upstream tarball.
+fn archive_identity(url: &str) -> Option<(String, String)> {
+    let filename = url.split(['?', '#']).next()?.rsplit('/').next()?;
+    if let Some(stem) = filename.strip_suffix(".deb") {
+        let parts: Vec<_> = stem.split('_').collect();
+        if let [name, version, arch] = parts.as_slice() {
+            if !name.is_empty()
+                && !arch.is_empty()
+                && version.starts_with(|c: char| c.is_ascii_digit())
+                && version
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b".+:~-".contains(&c))
+            {
+                return Some((name.to_string(), version.to_string()));
+            }
+        }
+        return None;
+    }
+    let stem = strip_archive_extension(filename)?;
+    for (index, _) in stem.match_indices('-') {
+        let name = &stem[..index];
+        let version = &stem[index + 1..];
+        let numeric = version.split(['-', '_']).next()?;
+        if numeric != version
+            && !["-rc", "-alpha", "-beta", "-pre"]
+                .iter()
+                .any(|prefix| version[numeric.len()..].starts_with(prefix))
+        {
+            continue;
+        }
+        let parts: Vec<_> = numeric.split('.').collect();
+        if !name.is_empty()
+            && parts.len() >= 2
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+            && version
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b".-_+".contains(&c))
+        {
+            return Some((name.to_string(), version.to_string()));
+        }
+    }
     None
 }
 
@@ -941,10 +1053,19 @@ fn normalize_git_version(value: &str) -> Option<String> {
 }
 
 fn strip_archive_extension(filename: &str) -> Option<String> {
-    [".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".zip"]
-        .iter()
-        .find_map(|suffix| filename.strip_suffix(suffix))
-        .map(str::to_string)
+    [
+        ".tar.gz",
+        ".tar.xz",
+        ".tar.bz2",
+        ".tar.zst",
+        ".tar.lz",
+        ".tar.lzma",
+        ".tgz",
+        ".zip",
+    ]
+    .iter()
+    .find_map(|suffix| filename.strip_suffix(suffix))
+    .map(str::to_string)
 }
 
 fn infer_pypi_wheel_purl(url: &str) -> Option<String> {
@@ -959,19 +1080,40 @@ fn infer_pypi_wheel_purl(url: &str) -> Option<String> {
 
     Some(format!(
         "pkg:pypi/{}@{}",
-        package.replace('_', "-").to_ascii_lowercase(),
+        normalize_pypi_name(package),
         version
     ))
 }
 
+fn normalize_pypi_name(name: &str) -> String {
+    name.split(['-', '_', '.'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_ascii_lowercase()
+}
+
 fn infer_cargo_crate_purl(url: &str) -> Option<String> {
-    let filename = last_url_segment(url)?.strip_suffix(".crate")?;
-    let (name, version) = filename.rsplit_once('-')?;
-    if name.is_empty() || version.is_empty() || !version.starts_with(|c: char| c.is_ascii_digit()) {
+    let path = url
+        .split(['?', '#'])
+        .next()?
+        .strip_prefix("https://static.crates.io/crates/")?;
+    let (name, filename) = path.split_once('/')?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    {
         return None;
     }
-
-    Some(format!("pkg:cargo/{name}@{version}"))
+    let version = filename
+        .strip_suffix(".crate")?
+        .strip_prefix(name)?
+        .strip_prefix('-')?;
+    semver::Version::parse(version).ok()?;
+    let mut purl = packageurl::PackageUrl::new("cargo", name).ok()?;
+    purl.with_version(version).ok()?;
+    Some(purl.to_string())
 }
 
 fn infer_nuget_purl(url: &str) -> Option<String> {
@@ -1019,7 +1161,11 @@ fn decode_go_proxy_module(module: &str) -> String {
 }
 
 fn last_url_segment(url: &str) -> Option<&str> {
-    url.rsplit('/').next().filter(|segment| !segment.is_empty())
+    url.split(['?', '#'])
+        .next()?
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
 }
 
 fn escape_ref(value: &str) -> String {
@@ -1028,6 +1174,77 @@ fn escape_ref(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identifies_ecosystem_archives_without_trusting_arbitrary_hosts() {
+        let source = super::Source {
+            url: Some(
+                "https://files.pythonhosted.org/packages/example/My.Package-1.2.3.tar.gz".into(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::infer_purl(&source).as_deref(),
+            Some("pkg:pypi/my-package@1.2.3")
+        );
+        assert_eq!(
+            super::infer_cargo_crate_purl(
+                "https://static.crates.io/crates/foo-bar/foo-bar-1.2.3-rc.1.crate"
+            )
+            .as_deref(),
+            Some("pkg:cargo/foo-bar@1.2.3-rc.1")
+        );
+        let arbitrary = super::Source {
+            url: Some("https://example.org/crates/example-1.2.3.crate".into()),
+            ..Default::default()
+        };
+        assert!(super::infer_purl(&arbitrary).is_none());
+    }
+    #[test]
+    fn cargo_archive_identity_uses_declared_crate_name_and_validates_version() {
+        for (name, version) in [
+            ("sha-1", "0.10.1"),
+            ("foo-2-bar", "1.2.3-rc.1"),
+            ("foo", "1.2.3+build.2"),
+        ] {
+            let url =
+                format!("https://static.crates.io/crates/{name}/{name}-{version}.crate?download=1");
+            let purl = super::infer_cargo_crate_purl(&url).unwrap();
+            let parsed = purl.parse::<packageurl::PackageUrl>().unwrap();
+            assert_eq!(parsed.name(), name);
+            assert_eq!(parsed.version(), Some(version));
+        }
+        for path in [
+            "sha-1/sha-2-0.10.1.crate",
+            "foo/foo-1.crate",
+            "foo/foo-01.2.3.crate",
+            "foo/foo-1.2.3-rc..1.crate",
+            "foo/sub/foo-1.2.3.crate",
+        ] {
+            assert!(super::infer_cargo_crate_purl(&format!(
+                "https://static.crates.io/crates/{path}"
+            ))
+            .is_none());
+        }
+    }
+    #[test]
+    fn archive_versions_are_candidates_not_invented_ecosystems() {
+        assert_eq!(
+            super::archive_identity("https://www.lua.org/ftp/lua-5.3.5.tar.gz"),
+            Some(("lua".into(), "5.3.5".into()))
+        );
+        assert_eq!(
+            super::archive_identity("https://example.org/lib-thing-1.2.3.tar.xz?download=1"),
+            Some(("lib-thing".into(), "1.2.3".into()))
+        );
+        assert_eq!(
+            super::archive_identity("https://example.org/snapshot-deadbeef.tar.gz"),
+            None
+        );
+        assert_eq!(
+            super::archive_identity("https://example.org/patch-123.tar.gz"),
+            None
+        );
+    }
     use super::*;
     use std::collections::BTreeMap;
 
@@ -1087,13 +1304,11 @@ mod tests {
         assert_eq!(bom.spec_version, "1.7");
         assert!(bom.serial_number.starts_with("urn:uuid:"));
         assert!(bom.metadata.timestamp.is_some());
-        assert!(bom.metadata.lifecycles.iter().any(|lifecycle| {
-            lifecycle.phase == "build"
-                && lifecycle
-                    .description
-                    .as_deref()
-                    .is_some_and(|description| description.contains("Manifest-derived SBOM"))
-        }));
+        assert!(bom
+            .metadata
+            .lifecycles
+            .iter()
+            .any(|lifecycle| lifecycle.phase == "build"));
         assert_eq!(
             bom.metadata
                 .component
@@ -1232,7 +1447,7 @@ mod tests {
         assert!(bom.components.iter().any(|component| {
             component.name == "zlib-helper"
                 && component.bom_ref
-                    == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=zlib_zlib-helper"
+                    == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=0_0"
                 && has_property(component, "flatpak:manifest-module", "zlib-helper")
                 && has_property(
                     component,
@@ -1243,13 +1458,13 @@ mod tests {
         assert!(bom.components.iter().any(|component| {
             component.name == "helper.patch"
                 && component.bom_ref
-                    == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=zlib_zlib-helper:source=0"
+                    == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=0_0:source=0"
         }));
         assert!(bom.dependencies.iter().any(|dependency| {
-            dependency.bom_ref == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=zlib"
+            dependency.bom_ref == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=0"
                 && dependency.depends_on.iter().any(|dependency_ref| {
                     dependency_ref
-                        == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=zlib_zlib-helper"
+                        == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=0_0"
                 })
         }));
         assert!(bom.components.iter().any(|component| {
@@ -1307,7 +1522,7 @@ mod tests {
             .iter()
             .any(|component| component.get("evidence").is_some()));
         assert_eq!(json["compositions"][0]["aggregate"], "incomplete");
-        assert!(json["compositions"][0]["properties"]
+        assert!(json["metadata"]["component"]["properties"]
             .as_array()
             .unwrap()
             .iter()

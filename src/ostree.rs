@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,7 @@ struct CachedRepo {
     _tempdir: TempDir,
     repo_url: String,
     path: PathBuf,
+    commits: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -121,6 +123,7 @@ impl RepositorySession {
             _tempdir: tempdir,
             repo_url: repo_url.to_string(),
             path: repo.clone(),
+            commits: BTreeMap::new(),
         });
 
         Ok(repo)
@@ -132,9 +135,17 @@ impl RepositorySession {
             format!("--repo={}", repo.display()),
             "pull".to_string(),
             "--depth=0".to_string(),
+            // Identify the application consistently for discovery, metadata,
+            // and content. Some repositories reject libostree's generic UA.
+            format!(
+                "--http-header=User-Agent=flatpak-sbom/{}",
+                env!("CARGO_PKG_VERSION")
+            ),
         ];
         if let Some(subpath) = subpath {
             args.push(format!("--subpath=/{}", subpath.trim_start_matches('/')));
+        } else {
+            args.push("--commit-metadata-only".to_string());
         }
         args.push("origin".to_string());
         args.push(ref_name.to_string());
@@ -149,13 +160,22 @@ impl RepositorySession {
         ref_name: &str,
         path: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let repo = self.pull_ref(repo_url, ref_name, Some(path))?;
+        self.ensure_repo(repo_url)?;
+        let pinned = self
+            .repo
+            .lock()
+            .expect("OSTree repo cache poisoned")
+            .as_ref()
+            .and_then(|repo| repo.commits.get(ref_name))
+            .cloned();
+        let revision = pinned.as_deref().unwrap_or(ref_name);
+        let repo = self.pull_ref(repo_url, revision, Some(path))?;
         let normalized = path.trim_start_matches('/');
         let output = self.output(
             vec![
                 format!("--repo={}", repo.display()),
                 "cat".to_string(),
-                format!("origin:{ref_name}"),
+                pinned.unwrap_or_else(|| format!("origin:{ref_name}")),
                 format!("/{normalized}"),
             ],
             "run ostree cat",
@@ -191,9 +211,20 @@ impl RepositorySession {
             );
         }
 
-        String::from_utf8(output.stdout)
+        let commit = String::from_utf8(output.stdout)
             .map(|value| value.trim().to_string())
-            .map_err(|err| anyhow!(err))
+            .map_err(|err| anyhow!(err))?;
+        if commit.len() != 64 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("ostree returned an invalid commit checksum");
+        }
+        self.repo
+            .lock()
+            .expect("OSTree repo cache poisoned")
+            .as_mut()
+            .expect("repository initialized")
+            .commits
+            .insert(ref_name.to_string(), commit.clone());
+        Ok(commit)
     }
 }
 
@@ -207,6 +238,37 @@ impl CliOstreeFileReader {
         Self {
             session: RepositorySession::new(commands),
         }
+    }
+}
+
+impl crate::content::ContentSource for CliOstreeFileReader {
+    fn content_tree(
+        &self,
+        repo_url: &str,
+        _reference: &str,
+        commit: &str,
+    ) -> Result<crate::content::ContentTree> {
+        if commit.len() != 64 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("invalid content checkout commit checksum");
+        }
+        // Pull and check out the recorded checksum, never a moving ref. Keep
+        // ownership local and copy files so scanners cannot modify repo objects.
+        let repo = self.session.pull_ref(repo_url, commit, Some("files"))?;
+        let directory = tempfile::tempdir().context("create content checkout directory")?;
+        let tree = crate::content::ContentTree::checkout(directory);
+        self.session.run(vec![
+            format!("--repo={}", repo.display()),
+            "checkout".into(),
+            "--user-mode".into(),
+            "--force-copy".into(),
+            "--subpath=/files".into(),
+            commit.to_string(),
+            tree.path.to_string_lossy().into_owned(),
+        ])?;
+        Ok(tree)
+    }
+    fn content_origin(&self) -> &'static str {
+        "ostree-checkout"
     }
 }
 
@@ -405,5 +467,96 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("network unavailable"));
+    }
+
+    #[test]
+    fn reads_pinned_commit_after_resolution_without_pulling_full_tree() {
+        let commit = "a".repeat(64);
+        let commands = RecordingCommands::with_outputs(vec![
+            success(vec![]),
+            success(vec![]),
+            success(vec![]),
+            success(commit.as_bytes()),
+            success(vec![]),
+            success(b"old manifest"),
+        ]);
+        let reader = CliOstreeFileReader::with_commands(commands.clone());
+        let reference = "app/org.example.App/x86_64/stable";
+        assert_eq!(
+            reader.resolve_ref("https://repo.test", reference).unwrap(),
+            commit
+        );
+        reader
+            .read_file_from_ref("https://repo.test", reference, "files/manifest.json")
+            .unwrap();
+        let calls = commands.calls();
+        assert!(calls[2].contains(&"--commit-metadata-only".to_string()));
+        assert_eq!(calls[4].last(), Some(&commit));
+        assert_eq!(calls[5][2], commit);
+    }
+
+    #[test]
+    #[ignore = "requires ostree; run in acceptance CI"]
+    fn real_repository_update_does_not_change_pinned_contents() {
+        use crate::content::ContentSource;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("remote");
+        let tree = temp.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let run = |args: &[&str]| {
+            let output = Command::new("ostree")
+                .arg(format!("--repo={}", repo.display()))
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "--mode=archive"]);
+        let reference = "app/org.example.App/x86_64/stable";
+        let commit = || {
+            run(&[
+                "commit",
+                &format!("--branch={reference}"),
+                &format!("--tree=dir={}", tree.display()),
+                "--subject=fixture",
+            ])
+        };
+        std::fs::write(tree.join("metadata"), "old").unwrap();
+        std::fs::create_dir(tree.join("files")).unwrap();
+        std::fs::write(tree.join("files/dependency.txt"), "old package").unwrap();
+        commit();
+        let reader = CliOstreeFileReader::new();
+        let url = format!("file://{}", repo.display());
+        let checksum = reader.resolve_ref(&url, reference).unwrap();
+        std::fs::write(tree.join("metadata"), "new").unwrap();
+        std::fs::write(tree.join("files/dependency.txt"), "new package").unwrap();
+        commit();
+        assert_eq!(
+            reader
+                .read_file_from_ref(&url, reference, "metadata")
+                .unwrap(),
+            Some(b"old".to_vec())
+        );
+        assert_eq!(
+            reader
+                .read_file_from_ref(&url, reference, "absent")
+                .unwrap(),
+            None
+        );
+        let checkout = reader.content_tree(&url, reference, &checksum).unwrap();
+        assert_eq!(
+            std::fs::read(checkout.path.join("dependency.txt")).unwrap(),
+            b"old package"
+        );
+        let checkout_path = checkout.path.clone();
+        drop(checkout);
+        assert!(
+            !checkout_path.exists(),
+            "temporary content must be removed after scanning"
+        );
     }
 }
