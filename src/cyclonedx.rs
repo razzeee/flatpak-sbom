@@ -71,18 +71,10 @@ pub struct Evidence {
 }
 
 #[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct EvidenceIdentity {
     pub field: String,
-    pub confidence: f32,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub methods: Vec<EvidenceIdentityMethod>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct EvidenceIdentityMethod {
-    pub technique: String,
-    pub confidence: f32,
-    pub value: String,
+    pub concluded_value: String,
 }
 
 #[derive(Debug, Serialize, Clone)]

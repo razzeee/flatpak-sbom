@@ -198,7 +198,19 @@ adequate upstream build evidence establishes their inventory.
 
 `generate` writes CycloneDX 1.7. `scan --scanner grype` writes a temporary CycloneDX 1.6 document for Grype compatibility because current Grype/Syft releases reject CycloneDX 1.7 input.
 
+Each app or runtime read is a snapshot: its ref is resolved once, and its metadata and manifests are read from that exact commit. Ref resolution fetches only commit metadata; subsequent pulls fetch only the requested paths, with static deltas disabled to avoid downloading unrelated payloads. A temporary OSTree repository is reused within one invocation, not across invocations. The runtime snapshot represents the remote's current runtime, not necessarily the runtime installed on a particular machine.
+
+`report` requires a Grype JSON report with a `matches` array and valid vulnerability/artifact identities. Unrecognized or malformed reports fail instead of appearing to contain zero findings.
+
+Package identity inference recognizes explicit ecosystem URL layouts and uses standard URL parsing and PURL encoding. Unknown hosts and ambiguous archive names remain unidentified; a `/crates/` path on an arbitrary host is not sufficient to identify a Cargo package. Evidence records identity values alongside manifest provenance, without uncalibrated confidence scores.
+
+Module references use their structural position in the published manifest (for example, `/modules/0/modules/1`), so repeated names and names containing separators remain distinct. The readable module path is retained as provenance alongside `flatpak:manifest-module-pointer`. Module and source indexes refer to the original manifest, before architecture filtering.
+
+Flatpak refs are validated before fetching. Runtime metadata takes precedence; when it is absent, the manifest must supply both `runtime` and `runtime-version`, using the app's architecture.
+
 ## Development
+
+Install `ostree` before running the tests. The integration tests create local repositories and exercise real selective pulls and app/runtime SBOM generation without network access. Running `scan` additionally requires `grype` on `PATH`.
 
 ```sh
 cargo fmt --check
@@ -279,7 +291,7 @@ fixture binaries. They compile fixtures but never execute them.
 python3 -m venv .venv
 .venv/bin/pip install jsonschema==4.26.0
 cargo build --locked
-cargo test --locked real_repository_update -- --ignored
+cargo test --locked reads_real_repository_without_fetching_unrequested_payloads
 .venv/bin/python tests/acceptance.py
 grype db update
 TEST_SYFT=1 TEST_GRYPE=1 GRYPE_DB_AUTO_UPDATE=false .venv/bin/python tests/acceptance.py
@@ -298,7 +310,7 @@ Malformed ASAR metadata, including invalid JSON in an indexed `package.json`
 member, fails the entire scan without replacing the previous SBOM. Such members
 are not silently skipped; valid package JSON lacking a name/version is not
 identified as a package. The Rust acceptance test
-updates a remote between resolution and reading/checkout to verify snapshot
+updates a remote between snapshot acquisition and content checkout to verify snapshot
 consistency and temporary-tree cleanup. The HTTP fixture also tests finding and
 scanning an undeclared shipped package without installing the app.
 

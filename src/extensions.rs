@@ -45,7 +45,7 @@ pub fn include(
             continue;
         }
         let extension = FlatpakRef::parse(reference)?;
-        if extension.kind != "runtime" {
+        if extension.kind() != "runtime" {
             bail!("extension must be a runtime ref: {reference}");
         }
         let mut parents = Vec::new();
@@ -70,13 +70,15 @@ pub fn include(
         if parents.is_empty() {
             bail!("selected extension {reference} does not match an app/runtime declaration (name, architecture and branch)");
         }
-        let commit = reader
-            .resolve_ref(repo, reference)
-            .with_context(|| format!("resolve extension {reference}"))?;
-        let metadata = reader
-            .read_file_from_ref(repo, reference, "metadata")?
+        let snapshot = reader
+            .read_snapshot(repo, reference, &["metadata"])
+            .with_context(|| format!("read extension {reference}"))?;
+        let commit = snapshot.commit;
+        let metadata = snapshot
+            .files
+            .get("metadata")
             .context("selected extension has no metadata")?;
-        let metadata = FlatpakMetadata::parse(std::str::from_utf8(&metadata)?)?;
+        let metadata = FlatpakMetadata::parse(std::str::from_utf8(metadata)?)?;
         // Derived runtimes (e.g. GNOME) can declare extensions built for their
         // Freedesktop base. Preserve ExtensionOf as build provenance; it does
         // not replace the consuming runtime's extension declaration.
@@ -104,9 +106,9 @@ pub fn include(
         crate::sbom::push_metadata_properties(&mut properties, &metadata);
         bom.components.push(Component {
             component_type: "framework".into(),
-            name: extension.id,
+            name: extension.id().to_string(),
             bom_ref: bom_ref.clone(),
-            version: Some(extension.branch),
+            version: Some(extension.branch().to_string()),
             purl: None,
             cpe: None,
             external_references: vec![],
@@ -300,7 +302,7 @@ fn parse_discovery(text: &str, parent: &str, commit: &str) -> Result<Vec<Discove
             .context("malformed Flatpak extension discovery")?;
         let value = value.trim();
         if key == "Extension" {
-            if FlatpakRef::parse(value)?.kind != "runtime" {
+            if FlatpakRef::parse(value)?.kind() != "runtime" {
                 bail!("discovered extension is not a runtime ref");
             }
             extensions.push(DiscoveredExtension {
@@ -346,19 +348,19 @@ fn matches_declaration(extension: &FlatpakRef, declaration: &Value) -> Result<bo
         .context("missing extension declaration name")?;
     let name = name.split('@').next().unwrap();
     let fields = &declaration["metadata"];
-    let name_matches = extension.id == name
+    let name_matches = extension.id() == name
         || (fields["subdirectories"] == "true"
             && extension
-                .id
+                .id()
                 .strip_prefix(name)
                 .is_some_and(|suffix| suffix.starts_with('.') && suffix.len() > 1));
     let versions = fields["versions"]
         .as_str()
         .or_else(|| fields["version"].as_str())
-        .unwrap_or(&parent.branch);
+        .unwrap_or(parent.branch());
     Ok(name_matches
-        && extension.arch == parent.arch
-        && versions.split(';').any(|v| v == extension.branch))
+        && extension.arch() == parent.arch()
+        && versions.split(';').any(|v| v == extension.branch()))
 }
 
 #[cfg(test)]

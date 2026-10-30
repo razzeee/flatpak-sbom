@@ -31,6 +31,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install OSTree for integration tests
+        run: sudo apt-get update && sudo apt-get install -y ostree
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -67,7 +70,7 @@ jobs:
       - name: Build and verify repository consistency
         run: |
           cargo build --locked
-          cargo test --locked real_repository_update -- --ignored
+          cargo test --locked reads_real_repository_without_fetching_unrequested_payloads
       - name: Install pinned Syft
         env:
           GH_TOKEN: ${{ github.token }}

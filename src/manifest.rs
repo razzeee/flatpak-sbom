@@ -36,79 +36,9 @@ impl Module {
         }
     }
 
-    pub fn sources(&self) -> &[Source] {
+    pub fn object(&self) -> Option<&ModuleObject> {
         match self {
-            Self::Object(module) => &module.sources,
-            Self::Name(_) => &[],
-        }
-    }
-
-    pub fn modules(&self) -> &[Module] {
-        match self {
-            Self::Object(module) => &module.modules,
-            Self::Name(_) => &[],
-        }
-    }
-
-    pub fn license(&self) -> Option<&str> {
-        match self {
-            Self::Object(module) => module.license.as_deref(),
-            Self::Name(_) => None,
-        }
-    }
-
-    pub fn buildsystem(&self) -> Option<&str> {
-        match self {
-            Self::Object(module) => module.buildsystem.as_deref(),
-            Self::Name(_) => None,
-        }
-    }
-
-    pub fn builddir(&self) -> Option<bool> {
-        match self {
-            Self::Object(module) => module.builddir,
-            Self::Name(_) => None,
-        }
-    }
-
-    pub fn subdir(&self) -> Option<&str> {
-        match self {
-            Self::Object(module) => module.subdir.as_deref(),
-            Self::Name(_) => None,
-        }
-    }
-
-    pub fn config_opts(&self) -> Option<&[String]> {
-        match self {
-            Self::Object(module) => module.config_opts.as_deref(),
-            Self::Name(_) => None,
-        }
-    }
-
-    pub fn cleanup(&self) -> Option<&[String]> {
-        match self {
-            Self::Object(module) => module.cleanup.as_deref(),
-            Self::Name(_) => None,
-        }
-    }
-
-    pub fn cleanup_commands(&self) -> Option<&[String]> {
-        match self {
-            Self::Object(module) => module.cleanup_commands.as_deref(),
-            Self::Name(_) => None,
-        }
-    }
-
-    pub fn post_install(&self) -> Option<&[String]> {
-        match self {
-            Self::Object(module) => module.post_install.as_deref(),
-            Self::Name(_) => None,
-        }
-    }
-
-    pub fn extra(&self) -> Option<&BTreeMap<String, Value>> {
-        match self {
-            Self::Object(module) => Some(&module.extra),
+            Self::Object(module) => Some(module),
             Self::Name(_) => None,
         }
     }
@@ -131,7 +61,7 @@ pub struct ModuleObject {
     pub name: Option<String>,
     pub license: Option<String>,
     pub buildsystem: Option<String>,
-    pub builddir: Option<bool>,
+    pub builddir: Option<Value>,
     pub subdir: Option<String>,
     pub config_opts: Option<Vec<String>>,
     pub cleanup: Option<Vec<String>>,
@@ -212,7 +142,7 @@ mod tests {
         )
         .unwrap();
 
-        let source = &manifest.modules[0].sources()[0];
+        let source = &manifest.modules[0].object().unwrap().sources[0];
         assert_eq!(source.source_type.as_deref(), Some("extra-data"));
         assert_eq!(source.size, Some(12));
         assert_eq!(source.dest_filename.as_deref(), Some("a.bin"));
@@ -226,7 +156,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            manifest.modules[0].sources()[0].path.as_deref(),
+            manifest.modules[0].object().unwrap().sources[0]
+                .path
+                .as_deref(),
             Some("appdata.xml")
         );
     }
@@ -240,8 +172,8 @@ mod tests {
 
         assert!(manifest.modules[0].applies_to_arch("x86_64"));
         assert!(!manifest.modules[0].applies_to_arch("aarch64"));
-        assert!(manifest.modules[0].sources()[0].applies_to_arch("x86_64"));
-        assert!(!manifest.modules[0].sources()[0].applies_to_arch("aarch64"));
+        assert!(manifest.modules[0].object().unwrap().sources[0].applies_to_arch("x86_64"));
+        assert!(!manifest.modules[0].object().unwrap().sources[0].applies_to_arch("aarch64"));
     }
 
     #[test]
@@ -250,6 +182,9 @@ mod tests {
             serde_json::from_str(r#"{"modules":[{"name":"parent","modules":[{"name":"child"}]}]}"#)
                 .unwrap();
 
-        assert_eq!(manifest.modules[0].modules()[0].name(), "child");
+        assert_eq!(
+            manifest.modules[0].object().unwrap().modules[0].name(),
+            "child"
+        );
     }
 }

@@ -1,10 +1,10 @@
 use crate::cyclonedx::{
     property, Bom, Component, Composition, Dependency, Evidence, EvidenceIdentity,
-    EvidenceIdentityMethod, ExternalReference, Hash, LicenseChoice, Lifecycle, Metadata, Tools,
+    ExternalReference, Hash, LicenseChoice, Lifecycle, Metadata, Tools,
 };
 use crate::manifest::{FlatpakManifest, Source};
 use crate::metadata::FlatpakMetadata;
-use crate::ostree::OstreeFileReader;
+use crate::ostree::{OstreeFileReader, RepositorySnapshot};
 use crate::refname::FlatpakRef;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
@@ -18,35 +18,43 @@ pub fn generate_for_app(
     app_ref: &str,
 ) -> Result<Bom> {
     let app_ref = FlatpakRef::parse(app_ref)?;
-    if app_ref.kind != "app" {
+    if app_ref.kind() != "app" {
         return Err(anyhow!(
             "generate expects an app ref, got '{}'",
             app_ref.as_str()
         ));
     }
 
-    let app_commit = reader
-        .resolve_ref(repo_url, &app_ref.as_str())
-        .context("resolve app ref")?;
-    let app_metadata =
-        read_metadata(reader, repo_url, &app_ref.as_str()).context("read app metadata")?;
-    let app_manifest = read_manifest(reader, repo_url, &app_ref.as_str(), "files/manifest.json")
+    let app_snapshot = reader
+        .read_snapshot(
+            repo_url,
+            &app_ref.as_str(),
+            &["metadata", "files/manifest.json"],
+        )
+        .context("read app snapshot")?;
+    let app_commit = app_snapshot.commit.clone();
+    let app_metadata = read_metadata(&app_snapshot).context("read app metadata")?;
+    let (app_manifest, _) = read_manifest_from_paths(&app_snapshot, &["files/manifest.json"])
         .context("read app manifest")?;
 
-    let runtime_value = app_metadata
-        .runtime()
-        .or(app_manifest.runtime.as_deref())
-        .ok_or_else(|| anyhow!("app metadata and manifest do not declare a runtime"))?;
-    let runtime_ref = FlatpakRef::runtime_from_metadata(runtime_value, &app_ref.arch)?;
-    let runtime_commit = reader
-        .resolve_ref(repo_url, &runtime_ref.as_str())
-        .context("resolve runtime ref")?;
-    let runtime_metadata =
-        read_metadata(reader, repo_url, &runtime_ref.as_str()).context("read runtime metadata")?;
+    let runtime_ref = FlatpakRef::runtime(
+        app_metadata.runtime(),
+        app_manifest.runtime.as_deref(),
+        app_manifest.runtime_version.as_deref(),
+        app_ref.arch(),
+    )
+    .context("determine runtime ref")?;
+    let runtime_snapshot = reader
+        .read_snapshot(
+            repo_url,
+            &runtime_ref.as_str(),
+            &["metadata", "files/manifest.json", "usr/manifest.json"],
+        )
+        .context("read runtime snapshot")?;
+    let runtime_commit = runtime_snapshot.commit.clone();
+    let runtime_metadata = read_metadata(&runtime_snapshot).context("read runtime metadata")?;
     let (runtime_manifest, runtime_manifest_path) = read_manifest_from_paths(
-        reader,
-        repo_url,
-        &runtime_ref.as_str(),
+        &runtime_snapshot,
         &["files/manifest.json", "usr/manifest.json"],
     )
     .context("read runtime manifest")?;
@@ -125,6 +133,7 @@ pub fn generate_for_app(
             extension_group_count.to_string(),
         ));
     }
+
     for (scope, metadata, reference, commit) in [
         ("app", &app_metadata, app_ref.as_str(), &app_commit),
         (
@@ -137,13 +146,9 @@ pub fn generate_for_app(
         let declarations: Vec<_> = metadata
             .extension_groups()
             .map(|(group, fields)| {
-                serde_json::json!({
-                    "name": group.strip_prefix("Extension ").unwrap(),
-                    "parent_ref": reference,
-                    "parent_commit": commit,
-                    "metadata": fields,
-                    "status": "not-inventoried"
-                })
+                serde_json::json!({"name":group.strip_prefix("Extension ").unwrap(),
+                "parent_ref":reference, "parent_commit":commit,
+                "metadata":fields, "status":"not-inventoried"})
             })
             .collect();
         root_properties.push(property(
@@ -151,32 +156,20 @@ pub fn generate_for_app(
             serde_json::to_string(&declarations)?,
         ));
     }
-
     let root = Component {
         cpe: None,
         component_type: "application".to_string(),
-        name: app_ref.id.clone(),
+        name: app_ref.id().to_string(),
         bom_ref: root_ref.clone(),
-        version: Some(app_ref.branch.clone()),
-        purl: Some(format!(
-            "pkg:flatpak/{}?arch={}&branch={}",
-            app_ref.id, app_ref.arch, app_ref.branch
-        )),
+        version: Some(app_ref.branch().to_string()),
+        purl: Some(app_ref.purl()),
         external_references: vec![ExternalReference {
             reference_type: "distribution".to_string(),
             url: repo_url.to_string(),
         }],
         hashes: vec![],
         licenses: licenses_from_expression(app_manifest.license.as_deref()),
-        evidence: Some(component_evidence(
-            "purl",
-            format!(
-                "pkg:flatpak/{}?arch={}&branch={}",
-                app_ref.id, app_ref.arch, app_ref.branch
-            ),
-            "Flatpak ref and manifest identity",
-            0.9,
-        )),
+        evidence: Some(component_evidence("purl", app_ref.purl())),
         properties: root_properties,
     };
 
@@ -209,18 +202,8 @@ pub fn generate_for_app(
     let mut components = vec![app_artifact, runtime_artifact];
     let app_manifest_components = manifest_components(app_context, &app_manifest);
     let runtime_manifest_components = manifest_components(runtime_context, &runtime_manifest);
-    let app_module_refs = app_manifest_components
-        .modules
-        .iter()
-        .map(|module| module.bom_ref.clone())
-        .collect::<Vec<_>>();
-    let runtime_module_refs = runtime_manifest_components
-        .modules
-        .iter()
-        .map(|module| module.bom_ref.clone())
-        .collect::<Vec<_>>();
-    components.extend(app_manifest_components.components.iter().cloned());
-    components.extend(runtime_manifest_components.components.iter().cloned());
+    components.extend(app_manifest_components.components);
+    components.extend(runtime_manifest_components.components);
 
     let assemblies = components
         .iter()
@@ -232,11 +215,11 @@ pub fn generate_for_app(
     }];
     dependencies.push(Dependency {
         bom_ref: app_artifact_ref,
-        depends_on: app_module_refs,
+        depends_on: app_manifest_components.module_refs,
     });
     dependencies.push(Dependency {
         bom_ref: runtime_artifact_ref,
-        depends_on: runtime_module_refs,
+        depends_on: runtime_manifest_components.module_refs,
     });
     dependencies.extend(app_manifest_components.dependencies);
     dependencies.extend(runtime_manifest_components.dependencies);
@@ -285,42 +268,25 @@ pub fn generate_for_app(
     })
 }
 
-fn read_metadata(
-    reader: &impl OstreeFileReader,
-    repo_url: &str,
-    ref_name: &str,
-) -> Result<FlatpakMetadata> {
-    let bytes = reader
-        .read_file_from_ref(repo_url, ref_name, "metadata")?
-        .ok_or_else(|| anyhow!("metadata not found for {ref_name}"))?;
-    let text = String::from_utf8(bytes).context("metadata is not UTF-8")?;
-    FlatpakMetadata::parse(&text)
-}
-
-fn read_manifest(
-    reader: &impl OstreeFileReader,
-    repo_url: &str,
-    ref_name: &str,
-    path: &str,
-) -> Result<FlatpakManifest> {
-    let bytes = reader
-        .read_file_from_ref(repo_url, ref_name, path)?
-        .ok_or_else(|| anyhow!("{path} not found for {ref_name}"))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parse {path} for {ref_name}"))
+fn read_metadata(snapshot: &RepositorySnapshot) -> Result<FlatpakMetadata> {
+    let bytes = snapshot
+        .files
+        .get("metadata")
+        .ok_or_else(|| anyhow!("metadata not found for {}", snapshot.commit))?;
+    let text = std::str::from_utf8(bytes).context("metadata is not UTF-8")?;
+    FlatpakMetadata::parse(text)
 }
 
 fn read_manifest_from_paths(
-    reader: &impl OstreeFileReader,
-    repo_url: &str,
-    ref_name: &str,
+    snapshot: &RepositorySnapshot,
     paths: &[&str],
 ) -> Result<(FlatpakManifest, String)> {
     let mut missing_paths = Vec::new();
     for path in paths {
-        match reader.read_file_from_ref(repo_url, ref_name, path)? {
+        match snapshot.files.get(*path) {
             Some(bytes) => {
-                let manifest = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("parse {path} for {ref_name}"))?;
+                let manifest = serde_json::from_slice(bytes)
+                    .with_context(|| format!("parse {path} for {}", snapshot.commit))?;
                 return Ok((manifest, (*path).to_string()));
             }
             None => missing_paths.push(*path),
@@ -328,8 +294,9 @@ fn read_manifest_from_paths(
     }
 
     Err(anyhow!(
-        "none of {} found for {ref_name}",
-        missing_paths.join(", ")
+        "none of {} found for {}",
+        missing_paths.join(", "),
+        snapshot.commit
     ))
 }
 
@@ -351,10 +318,7 @@ fn artifact_component(
     if let Some(flatpak_metadata) = flatpak_metadata {
         push_metadata_properties(&mut properties, flatpak_metadata);
     }
-    let purl = format!(
-        "pkg:flatpak/{}?arch={}&branch={}",
-        context.flatpak_ref.id, context.flatpak_ref.arch, context.flatpak_ref.branch
-    );
+    let purl = context.flatpak_ref.purl();
 
     Component {
         cpe: None,
@@ -364,13 +328,13 @@ fn artifact_component(
             "framework"
         }
         .to_string(),
-        name: context.flatpak_ref.id.clone(),
+        name: context.flatpak_ref.id().to_string(),
         bom_ref: format!(
             "flatpak:{}@{}",
             context.flatpak_ref.as_str(),
             context.commit
         ),
-        version: Some(context.flatpak_ref.branch.clone()),
+        version: Some(context.flatpak_ref.branch().to_string()),
         purl: Some(purl.clone()),
         external_references: vec![ExternalReference {
             reference_type: "distribution".to_string(),
@@ -378,19 +342,14 @@ fn artifact_component(
         }],
         hashes: vec![],
         licenses: licenses_from_expression(license),
-        evidence: Some(component_evidence(
-            "purl",
-            purl,
-            "Resolved Flatpak ref",
-            1.0,
-        )),
+        evidence: Some(component_evidence("purl", purl)),
         properties,
     }
 }
 
 struct ManifestComponents {
     components: Vec<Component>,
-    modules: Vec<Component>,
+    module_refs: Vec<String>,
     dependencies: Vec<Dependency>,
 }
 
@@ -399,26 +358,26 @@ fn manifest_components(
     manifest: &FlatpakManifest,
 ) -> ManifestComponents {
     let mut components = Vec::new();
-    let mut modules = Vec::new();
+    let mut module_refs = Vec::new();
     let mut dependencies = Vec::new();
     for (index, module) in manifest.modules.iter().enumerate() {
-        if !module.applies_to_arch(&context.flatpak_ref.arch) {
+        if !module.applies_to_arch(context.flatpak_ref.arch()) {
             continue;
         }
 
-        let module_component = collect_module_components(
+        let module_ref = collect_module_components(
             context,
             module,
             &[module.name().to_string()],
-            &index.to_string(),
+            &format!("/modules/{index}"),
             &mut components,
             &mut dependencies,
         );
-        modules.push(module_component);
+        module_refs.push(module_ref);
     }
     ManifestComponents {
         components,
-        modules,
+        module_refs,
         dependencies,
     }
 }
@@ -427,31 +386,35 @@ fn collect_module_components(
     context: ComponentContext<'_>,
     module: &crate::manifest::Module,
     module_path: &[String],
-    identity_path: &str,
+    module_pointer: &str,
     components: &mut Vec<Component>,
     dependencies: &mut Vec<Dependency>,
-) -> Component {
+) -> String {
     let module_name = module.name();
+    let object = module.object();
     let module_path_string = module_path.join("/");
     let mut module_properties = with_module(base_properties(context), module_name);
     module_properties.push(property(
         "flatpak:manifest-module-path",
         &module_path_string,
     ));
+    module_properties.push(property("flatpak:manifest-module-pointer", module_pointer));
     push_optional(
         &mut module_properties,
         "flatpak:module-buildsystem",
-        module.buildsystem(),
+        object.and_then(|module| module.buildsystem.as_deref()),
     );
-    if let Some(builddir) = module.builddir() {
-        module_properties.push(property("flatpak:module-builddir", builddir.to_string()));
-    }
+    push_optional_value(
+        &mut module_properties,
+        "flatpak:module-builddir",
+        object.and_then(|module| module.builddir.as_ref()),
+    );
     push_optional(
         &mut module_properties,
         "flatpak:module-subdir",
-        module.subdir(),
+        object.and_then(|module| module.subdir.as_deref()),
     );
-    if let Some(config_opts) = module.config_opts() {
+    if let Some(config_opts) = object.and_then(|module| module.config_opts.as_deref()) {
         module_properties.push(property(
             "flatpak:module-config-opts",
             config_opts.join(" "),
@@ -460,68 +423,72 @@ fn collect_module_components(
     push_string_list(
         &mut module_properties,
         "flatpak:module-cleanup",
-        module.cleanup(),
+        object.and_then(|module| module.cleanup.as_deref()),
     );
     push_string_list(
         &mut module_properties,
         "flatpak:module-cleanup-commands",
-        module.cleanup_commands(),
+        object.and_then(|module| module.cleanup_commands.as_deref()),
     );
     push_string_list(
         &mut module_properties,
         "flatpak:module-post-install",
-        module.post_install(),
+        object.and_then(|module| module.post_install.as_deref()),
     );
-    if let Some(extra) = module.extra() {
-        push_extra_properties(&mut module_properties, "flatpak:module-extra", extra);
+    if let Some(object) = object {
+        push_extra_properties(
+            &mut module_properties,
+            "flatpak:module-extra",
+            &object.extra,
+        );
     }
 
     let module_component = Component {
         cpe: None,
         component_type: "library".to_string(),
         name: module_name.to_string(),
-        bom_ref: module_bom_ref(context, identity_path),
+        bom_ref: module_bom_ref(context, module_pointer),
         version: None,
         purl: None,
         external_references: vec![],
         hashes: vec![],
-        licenses: licenses_from_expression(module.license()),
-        evidence: Some(component_evidence(
-            "name",
-            module_name.to_string(),
-            "Flatpak manifest module name",
-            0.7,
-        )),
+        licenses: licenses_from_expression(object.and_then(|module| module.license.as_deref())),
+        evidence: Some(component_evidence("name", module_name.to_string())),
         properties: module_properties,
     };
     let module_ref = module_component.bom_ref.clone();
-    components.push(module_component.clone());
+    components.push(module_component);
 
     let mut depends_on = Vec::new();
-    for (index, child) in module.modules().iter().enumerate() {
-        if !child.applies_to_arch(&context.flatpak_ref.arch) {
+    for (index, child) in object
+        .map_or(&[][..], |module| module.modules.as_slice())
+        .iter()
+        .enumerate()
+    {
+        if !child.applies_to_arch(context.flatpak_ref.arch()) {
             continue;
         }
         let mut child_path = module_path.to_vec();
         child_path.push(child.name().to_string());
-        let child_component = collect_module_components(
+        let child_ref = collect_module_components(
             context,
             child,
             &child_path,
-            &format!("{identity_path}/{index}"),
+            &format!("{module_pointer}/modules/{index}"),
             components,
             dependencies,
         );
-        depends_on.push(child_component.bom_ref);
+        depends_on.push(child_ref);
     }
 
-    for (index, source) in module
-        .sources()
+    for (index, source) in object
+        .map_or(&[][..], |module| module.sources.as_slice())
         .iter()
         .enumerate()
-        .filter(|(_, source)| source.applies_to_arch(&context.flatpak_ref.arch))
+        .filter(|(_, source)| source.applies_to_arch(context.flatpak_ref.arch()))
     {
-        let source_component = source_component(context, module_name, identity_path, index, source);
+        let source_component =
+            source_component(context, module_name, module_pointer, index, source);
         depends_on.push(source_component.bom_ref.clone());
         dependencies.push(Dependency {
             bom_ref: source_component.bom_ref.clone(),
@@ -531,16 +498,16 @@ fn collect_module_components(
     }
 
     dependencies.push(Dependency {
-        bom_ref: module_ref,
+        bom_ref: module_ref.clone(),
         depends_on,
     });
-    module_component
+    module_ref
 }
 
 fn source_component(
     context: ComponentContext<'_>,
     module_name: &str,
-    module_path: &str,
+    module_pointer: &str,
     index: usize,
     source: &Source,
 ) -> Component {
@@ -633,8 +600,11 @@ fn source_component(
     }
     push_extra_properties(&mut properties, "flatpak:source-extra", &source.extra);
 
-    let purl = infer_purl(source);
-    let archive_identity = source.url.as_deref().and_then(archive_identity);
+    let purl = crate::package_identity::infer(source);
+    let archive_identity = source
+        .url
+        .as_deref()
+        .and_then(crate::package_identity::archive_candidate);
     let version_kind =
         if purl.as_deref().is_some_and(|purl| purl.contains('@')) || source.tag.is_some() {
             "release"
@@ -656,26 +626,20 @@ fn source_component(
     let evidence = source_evidence(source, purl.as_deref(), name);
 
     Component {
+        cpe: None,
         component_type: if purl.is_some() || archive_identity.is_some() {
             "library"
         } else {
             "file"
         }
         .to_string(),
-        cpe: None,
         name: package
             .as_ref()
             .map(|package| package.name())
             .or_else(|| archive_identity.as_ref().map(|(name, _)| name.as_str()))
             .unwrap_or(name)
             .to_string(),
-        bom_ref: format!(
-            "flatpak:{}@{}#module={}:source={}",
-            context.flatpak_ref.as_str(),
-            context.commit,
-            escape_ref(module_path),
-            index
-        ),
+        bom_ref: format!("{}:source={index}", module_bom_ref(context, module_pointer)),
         version: package
             .as_ref()
             .and_then(|package| package.version())
@@ -696,12 +660,12 @@ fn source_component(
     }
 }
 
-fn module_bom_ref(context: ComponentContext<'_>, module_path: &str) -> String {
+fn module_bom_ref(context: ComponentContext<'_>, module_pointer: &str) -> String {
     format!(
         "flatpak:{}@{}#module={}",
         context.flatpak_ref.as_str(),
         context.commit,
-        escape_ref(module_path)
+        module_pointer
     )
 }
 
@@ -731,6 +695,16 @@ fn push_optional(
 ) {
     if let Some(value) = value {
         properties.push(property(name, value));
+    }
+}
+
+fn push_optional_value(
+    properties: &mut Vec<crate::cyclonedx::Property>,
+    name: &str,
+    value: Option<&Value>,
+) {
+    if let Some(value) = value {
+        properties.push(property(name, json_property_value(value)));
     }
 }
 
@@ -862,302 +836,21 @@ fn licenses_from_expression(expression: Option<&str>) -> Vec<LicenseChoice> {
 
 fn source_evidence(source: &Source, purl: Option<&str>, fallback_name: &str) -> Option<Evidence> {
     if let Some(purl) = purl {
-        return Some(component_evidence(
-            "purl",
-            purl.to_string(),
-            "Inferred package URL from Flatpak source declaration",
-            0.8,
-        ));
+        return Some(component_evidence("purl", purl.to_string()));
     }
     if let Some(sha256) = source.sha256.as_deref() {
-        return Some(component_evidence(
-            "hash",
-            sha256.to_string(),
-            "Flatpak manifest SHA-256 source checksum",
-            0.9,
-        ));
+        return Some(component_evidence("hash", sha256.to_string()));
     }
-    if let Some(url) = source.url.as_deref() {
-        return Some(component_evidence(
-            "name",
-            url.to_string(),
-            "Flatpak manifest source URL",
-            0.6,
-        ));
-    }
-    if let Some(path) = source.path.as_deref() {
-        return Some(component_evidence(
-            "name",
-            path.to_string(),
-            "Flatpak manifest local source path",
-            0.6,
-        ));
-    }
-    Some(component_evidence(
-        "name",
-        fallback_name.to_string(),
-        "Derived from Flatpak source declaration",
-        0.4,
-    ))
+    Some(component_evidence("name", fallback_name.to_string()))
 }
 
-fn component_evidence(field: &str, value: String, technique: &str, confidence: f32) -> Evidence {
+fn component_evidence(field: &str, value: String) -> Evidence {
     Evidence {
         identity: Some(EvidenceIdentity {
             field: field.to_string(),
-            confidence,
-            methods: vec![EvidenceIdentityMethod {
-                technique: "manifest-analysis".to_string(),
-                confidence,
-                value: format!("{technique}: {value}"),
-            }],
+            concluded_value: value,
         }),
     }
-}
-
-fn infer_purl(source: &Source) -> Option<String> {
-    let url = source.url.as_deref()?;
-    if source.source_type.as_deref() == Some("git") && url.starts_with("https://github.com/") {
-        let path = url
-            .trim_start_matches("https://github.com/")
-            .trim_end_matches(".git");
-        if path.split('/').count() == 2 {
-            if let Some(version) = source
-                .tag
-                .as_deref()
-                .or(source.commit.as_deref())
-                .and_then(normalize_git_version)
-            {
-                return Some(format!("pkg:github/{path}@{version}"));
-            }
-            return Some(format!("pkg:github/{}", path));
-        }
-    }
-
-    if url.starts_with("https://github.com/") || url.starts_with("https://codeload.github.com/") {
-        if let Some(purl) = infer_github_release_purl(url) {
-            return Some(purl);
-        }
-    }
-
-    if url.starts_with("https://files.pythonhosted.org/") {
-        return infer_pypi_wheel_purl(url).or_else(|| {
-            let (name, version) = archive_identity(url)?;
-            Some(format!("pkg:pypi/{}@{version}", normalize_pypi_name(&name)))
-        });
-    }
-
-    if url.starts_with("https://static.crates.io/crates/") {
-        if let Some(purl) = infer_cargo_crate_purl(url) {
-            return Some(purl);
-        }
-    }
-
-    if url.starts_with("https://api.nuget.org/v3-flatcontainer/") {
-        return infer_nuget_purl(url);
-    }
-
-    if url.starts_with("https://proxy.golang.org/") && url.ends_with(".zip") {
-        return infer_go_proxy_purl(url);
-    }
-
-    None
-}
-
-// Filename evidence provides a candidate, not an ecosystem identity. In
-// particular, do not invent a PyPI/Cargo PURL for a generic upstream tarball.
-fn archive_identity(url: &str) -> Option<(String, String)> {
-    let filename = url.split(['?', '#']).next()?.rsplit('/').next()?;
-    if let Some(stem) = filename.strip_suffix(".deb") {
-        let parts: Vec<_> = stem.split('_').collect();
-        if let [name, version, arch] = parts.as_slice() {
-            if !name.is_empty()
-                && !arch.is_empty()
-                && version.starts_with(|c: char| c.is_ascii_digit())
-                && version
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b".+:~-".contains(&c))
-            {
-                return Some((name.to_string(), version.to_string()));
-            }
-        }
-        return None;
-    }
-    let stem = strip_archive_extension(filename)?;
-    for (index, _) in stem.match_indices('-') {
-        let name = &stem[..index];
-        let version = &stem[index + 1..];
-        let numeric = version.split(['-', '_']).next()?;
-        if numeric != version
-            && !["-rc", "-alpha", "-beta", "-pre"]
-                .iter()
-                .any(|prefix| version[numeric.len()..].starts_with(prefix))
-        {
-            continue;
-        }
-        let parts: Vec<_> = numeric.split('.').collect();
-        if !name.is_empty()
-            && parts.len() >= 2
-            && parts
-                .iter()
-                .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
-            && version
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b".-_+".contains(&c))
-        {
-            return Some((name.to_string(), version.to_string()));
-        }
-    }
-    None
-}
-
-fn infer_github_release_purl(url: &str) -> Option<String> {
-    let path = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("https://codeload.github.com/"))?;
-    let parts = path.split('/').collect::<Vec<_>>();
-    let [owner, repo, rest @ ..] = parts.as_slice() else {
-        return None;
-    };
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-
-    let version = match rest {
-        ["archive", "refs", "tags", tag_file, ..] => strip_archive_extension(tag_file),
-        ["releases", "download", tag, ..] => Some((*tag).to_string()),
-        ["tar.gz", "refs", "tags", tag, ..] => Some((*tag).to_string()),
-        ["zip", "refs", "tags", tag, ..] => Some((*tag).to_string()),
-        _ => None,
-    }?;
-
-    if version.is_empty() {
-        return None;
-    }
-
-    Some(format!("pkg:github/{owner}/{repo}@{version}"))
-}
-
-fn normalize_git_version(value: &str) -> Option<String> {
-    if value.is_empty() || value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return None;
-    }
-
-    if let Some((tag, _commit)) = value.split_once("-0-g") {
-        if !tag.is_empty() {
-            return Some(tag.to_string());
-        }
-    }
-
-    Some(value.to_string())
-}
-
-fn strip_archive_extension(filename: &str) -> Option<String> {
-    [
-        ".tar.gz",
-        ".tar.xz",
-        ".tar.bz2",
-        ".tar.zst",
-        ".tar.lz",
-        ".tar.lzma",
-        ".tgz",
-        ".zip",
-    ]
-    .iter()
-    .find_map(|suffix| filename.strip_suffix(suffix))
-    .map(str::to_string)
-}
-
-fn infer_pypi_wheel_purl(url: &str) -> Option<String> {
-    let filename = last_url_segment(url)?.strip_suffix(".whl")?;
-    let mut parts = filename.split('-');
-    let package = parts.next()?;
-    let version = parts.next()?;
-
-    if package.is_empty() || version.is_empty() || parts.count() < 3 {
-        return None;
-    }
-
-    Some(format!(
-        "pkg:pypi/{}@{}",
-        normalize_pypi_name(package),
-        version
-    ))
-}
-
-fn normalize_pypi_name(name: &str) -> String {
-    name.split(['-', '_', '.'])
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-        .to_ascii_lowercase()
-}
-
-fn infer_cargo_crate_purl(url: &str) -> Option<String> {
-    let path = url
-        .split(['?', '#'])
-        .next()?
-        .strip_prefix("https://static.crates.io/crates/")?;
-    let (name, filename) = path.split_once('/')?;
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-    {
-        return None;
-    }
-    let version = filename
-        .strip_suffix(".crate")?
-        .strip_prefix(name)?
-        .strip_prefix('-')?;
-    semver::Version::parse(version).ok()?;
-    let mut purl = packageurl::PackageUrl::new("cargo", name).ok()?;
-    purl.with_version(version).ok()?;
-    Some(purl.to_string())
-}
-
-fn infer_nuget_purl(url: &str) -> Option<String> {
-    let path = url.trim_start_matches("https://api.nuget.org/v3-flatcontainer/");
-    let mut parts = path.split('/');
-    let package = parts.next()?;
-    let version = parts.next()?;
-    let filename = parts.next()?;
-
-    if package.is_empty() || version.is_empty() || !filename.ends_with(".nupkg") {
-        return None;
-    }
-
-    Some(format!("pkg:nuget/{package}@{version}"))
-}
-
-fn infer_go_proxy_purl(url: &str) -> Option<String> {
-    let path = url.trim_start_matches("https://proxy.golang.org/");
-    let (module, version_file) = path.split_once("/@v/")?;
-    let version = version_file.strip_suffix(".zip")?;
-    if module.is_empty() || version.is_empty() {
-        return None;
-    }
-
-    Some(format!(
-        "pkg:golang/{}@{}",
-        decode_go_proxy_module(module),
-        version
-    ))
-}
-
-fn decode_go_proxy_module(module: &str) -> String {
-    let mut decoded = String::with_capacity(module.len());
-    let mut chars = module.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '!' {
-            if let Some(next) = chars.next() {
-                decoded.push(next.to_ascii_uppercase());
-            }
-        } else {
-            decoded.push(ch);
-        }
-    }
-    decoded
 }
 
 fn last_url_segment(url: &str) -> Option<&str> {
@@ -1168,83 +861,8 @@ fn last_url_segment(url: &str) -> Option<&str> {
         .filter(|segment| !segment.is_empty())
 }
 
-fn escape_ref(value: &str) -> String {
-    value.replace([' ', '/'], "_")
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn identifies_ecosystem_archives_without_trusting_arbitrary_hosts() {
-        let source = super::Source {
-            url: Some(
-                "https://files.pythonhosted.org/packages/example/My.Package-1.2.3.tar.gz".into(),
-            ),
-            ..Default::default()
-        };
-        assert_eq!(
-            super::infer_purl(&source).as_deref(),
-            Some("pkg:pypi/my-package@1.2.3")
-        );
-        assert_eq!(
-            super::infer_cargo_crate_purl(
-                "https://static.crates.io/crates/foo-bar/foo-bar-1.2.3-rc.1.crate"
-            )
-            .as_deref(),
-            Some("pkg:cargo/foo-bar@1.2.3-rc.1")
-        );
-        let arbitrary = super::Source {
-            url: Some("https://example.org/crates/example-1.2.3.crate".into()),
-            ..Default::default()
-        };
-        assert!(super::infer_purl(&arbitrary).is_none());
-    }
-    #[test]
-    fn cargo_archive_identity_uses_declared_crate_name_and_validates_version() {
-        for (name, version) in [
-            ("sha-1", "0.10.1"),
-            ("foo-2-bar", "1.2.3-rc.1"),
-            ("foo", "1.2.3+build.2"),
-        ] {
-            let url =
-                format!("https://static.crates.io/crates/{name}/{name}-{version}.crate?download=1");
-            let purl = super::infer_cargo_crate_purl(&url).unwrap();
-            let parsed = purl.parse::<packageurl::PackageUrl>().unwrap();
-            assert_eq!(parsed.name(), name);
-            assert_eq!(parsed.version(), Some(version));
-        }
-        for path in [
-            "sha-1/sha-2-0.10.1.crate",
-            "foo/foo-1.crate",
-            "foo/foo-01.2.3.crate",
-            "foo/foo-1.2.3-rc..1.crate",
-            "foo/sub/foo-1.2.3.crate",
-        ] {
-            assert!(super::infer_cargo_crate_purl(&format!(
-                "https://static.crates.io/crates/{path}"
-            ))
-            .is_none());
-        }
-    }
-    #[test]
-    fn archive_versions_are_candidates_not_invented_ecosystems() {
-        assert_eq!(
-            super::archive_identity("https://www.lua.org/ftp/lua-5.3.5.tar.gz"),
-            Some(("lua".into(), "5.3.5".into()))
-        );
-        assert_eq!(
-            super::archive_identity("https://example.org/lib-thing-1.2.3.tar.xz?download=1"),
-            Some(("lib-thing".into(), "1.2.3".into()))
-        );
-        assert_eq!(
-            super::archive_identity("https://example.org/snapshot-deadbeef.tar.gz"),
-            None
-        );
-        assert_eq!(
-            super::archive_identity("https://example.org/patch-123.tar.gz"),
-            None
-        );
-    }
     use super::*;
     use std::collections::BTreeMap;
 
@@ -1261,23 +879,26 @@ mod tests {
     }
 
     impl OstreeFileReader for FixtureReader {
-        fn read_file_from_ref(
+        fn read_snapshot(
             &self,
             _repo_url: &str,
             ref_name: &str,
-            path: &str,
-        ) -> Result<Option<Vec<u8>>> {
-            Ok(self
-                .files
-                .get(&(ref_name.to_string(), path.to_string()))
-                .cloned())
-        }
-
-        fn resolve_ref(&self, _repo_url: &str, ref_name: &str) -> Result<String> {
-            self.commits
+            paths: &[&str],
+        ) -> Result<RepositorySnapshot> {
+            let commit = self
+                .commits
                 .get(ref_name)
                 .cloned()
-                .ok_or_else(|| anyhow!("missing commit"))
+                .ok_or_else(|| anyhow!("missing commit"))?;
+            let files = paths
+                .iter()
+                .filter_map(|path| {
+                    self.files
+                        .get(&(ref_name.to_string(), path.to_string()))
+                        .map(|bytes| (path.to_string(), bytes.clone()))
+                })
+                .collect();
+            Ok(RepositorySnapshot { commit, files })
         }
     }
 
@@ -1375,7 +996,7 @@ mod tests {
                     .evidence
                     .as_ref()
                     .and_then(|evidence| evidence.identity.as_ref())
-                    .is_some_and(|identity| identity.confidence == 1.0)
+                    .is_some_and(|identity| identity.field == "purl")
                 && has_property(
                     component,
                     "flatpak:metadata:Application:command",
@@ -1447,7 +1068,7 @@ mod tests {
         assert!(bom.components.iter().any(|component| {
             component.name == "zlib-helper"
                 && component.bom_ref
-                    == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=0_0"
+                    == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=/modules/0/modules/0"
                 && has_property(component, "flatpak:manifest-module", "zlib-helper")
                 && has_property(
                     component,
@@ -1458,13 +1079,13 @@ mod tests {
         assert!(bom.components.iter().any(|component| {
             component.name == "helper.patch"
                 && component.bom_ref
-                    == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=0_0:source=0"
+                    == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=/modules/0/modules/0:source=0"
         }));
         assert!(bom.dependencies.iter().any(|dependency| {
-            dependency.bom_ref == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=0"
+            dependency.bom_ref == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=/modules/0"
                 && dependency.depends_on.iter().any(|dependency_ref| {
                     dependency_ref
-                        == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=0_0"
+                        == "flatpak:app/org.example.App/x86_64/stable@appcommit#module=/modules/0/modules/0"
                 })
         }));
         assert!(bom.components.iter().any(|component| {
@@ -1515,6 +1136,24 @@ mod tests {
         }));
 
         let json = serde_json::to_value(&bom).unwrap();
+        let refs = bom
+            .components
+            .iter()
+            .map(|component| &component.bom_ref)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(refs.len(), bom.components.len());
+        for dependency in &bom.dependencies {
+            for target in &dependency.depends_on {
+                assert!(refs.contains(target), "missing dependency target {target}");
+            }
+        }
+        for component in json["components"].as_array().unwrap() {
+            if let Some(identity) = component.pointer("/evidence/identity") {
+                assert!(identity.get("confidence").is_none());
+                assert!(identity.get("methods").is_none());
+                assert!(identity["concludedValue"].is_string());
+            }
+        }
         assert_eq!(json["metadata"]["lifecycles"][0]["phase"], "build");
         assert!(json["components"]
             .as_array()
@@ -1535,6 +1174,100 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn manifest_fallback_and_structural_references_survive_colliding_names() {
+        let app_ref = "app/org.example.App/x86_64/stable";
+        let runtime_ref = "runtime/org.example.Platform/x86_64/1";
+        let manifest = serde_json::json!({
+            "runtime": "org.example.Platform", "runtime-version": "1",
+            "modules": [
+                {"name": "a_b"}, {"name": "a b"}, {"name": "a/b"},
+                {"name": "a", "modules": [{"name": "b"}, {"name": "b"}]},
+                {"name": "a_b"}, {}, {},
+                {"name": "skipped", "only-arches": ["aarch64"]},
+                {"name": "last", "sources": [
+                    {"type": "file", "path": "skipped", "only-arches": ["aarch64"]},
+                    {"type": "file", "path": "same"}, {"type": "file", "path": "same"}
+                ]}
+            ]
+        });
+        let reader = FixtureReader {
+            files: BTreeMap::from([
+                (
+                    (app_ref.into(), "metadata".into()),
+                    b"[Application]\n".to_vec(),
+                ),
+                (
+                    (app_ref.into(), "files/manifest.json".into()),
+                    serde_json::to_vec(&manifest).unwrap(),
+                ),
+                (
+                    (runtime_ref.into(), "metadata".into()),
+                    b"[Runtime]\n".to_vec(),
+                ),
+                (
+                    (runtime_ref.into(), "files/manifest.json".into()),
+                    br#"{"modules":[]}"#.to_vec(),
+                ),
+            ]),
+            commits: BTreeMap::from([
+                (app_ref.into(), "appcommit".into()),
+                (runtime_ref.into(), "runtimecommit".into()),
+            ]),
+        };
+        let bom = generate_for_app(&reader, "https://repo.test", app_ref).unwrap();
+        let refs = bom
+            .components
+            .iter()
+            .map(|c| c.bom_ref.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(refs.len(), bom.components.len());
+        assert_eq!(bom.components.len(), 14); // Two artifacts, ten modules, two sources.
+        for dependency in &bom.dependencies {
+            for target in &dependency.depends_on {
+                assert!(refs.contains(target.as_str()));
+            }
+        }
+        let prefix = format!("flatpak:{app_ref}@appcommit#module=");
+        let parent = bom
+            .dependencies
+            .iter()
+            .find(|d| d.bom_ref == format!("{prefix}/modules/3"))
+            .unwrap();
+        assert_eq!(
+            parent.depends_on,
+            [
+                format!("{prefix}/modules/3/modules/0"),
+                format!("{prefix}/modules/3/modules/1")
+            ]
+        );
+        assert!(refs.contains(format!("{prefix}/modules/8:source=1").as_str()));
+        assert!(refs.contains(format!("{prefix}/modules/8:source=2").as_str()));
+        assert!(!refs.contains(format!("{prefix}/modules/7").as_str()));
+        for module in &bom.components {
+            if let Some(pointer) = module
+                .properties
+                .iter()
+                .find(|p| p.name == "flatpak:manifest-module-pointer")
+            {
+                let original = manifest.pointer(&pointer.value).unwrap();
+                assert_eq!(
+                    module.name,
+                    original["name"].as_str().unwrap_or("unnamed-module")
+                );
+            }
+        }
+        let repeated = generate_for_app(&reader, "https://repo.test", app_ref).unwrap();
+        assert_eq!(
+            refs,
+            repeated
+                .components
+                .iter()
+                .map(|c| c.bom_ref.as_str())
+                .collect()
         );
     }
 
@@ -1561,119 +1294,5 @@ mod tests {
             .components
             .iter()
             .any(|component| component.name == "x86_64.tar.gz"));
-    }
-
-    #[test]
-    fn infers_pypi_purl_from_pythonhosted_wheel() {
-        let source = Source {
-            source_type: Some("file".to_string()),
-            url: Some("https://files.pythonhosted.org/packages/d4/8d/5e43d9584b3b3591a6f9b68f755a4da879a59712981ef5ad2a0ac1379f7a/bcrypt-5.0.0-cp39-abi3-manylinux_2_34_x86_64.whl".to_string()),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            infer_purl(&source).as_deref(),
-            Some("pkg:pypi/bcrypt@5.0.0")
-        );
-    }
-
-    #[test]
-    fn normalizes_pypi_wheel_package_name() {
-        assert_eq!(
-            infer_pypi_wheel_purl(
-                "https://files.pythonhosted.org/packages/example/My_Package-1.2.3-py3-none-any.whl"
-            )
-            .as_deref(),
-            Some("pkg:pypi/my-package@1.2.3")
-        );
-    }
-
-    #[test]
-    fn infers_github_purl_from_tag_archive() {
-        assert_eq!(
-            infer_github_release_purl(
-                "https://github.com/owner/project/archive/refs/tags/v1.2.3.tar.gz"
-            )
-            .as_deref(),
-            Some("pkg:github/owner/project@v1.2.3")
-        );
-    }
-
-    #[test]
-    fn infers_github_purl_from_release_asset() {
-        assert_eq!(
-            infer_github_release_purl(
-                "https://github.com/owner/project/releases/download/v1.2.3/project-linux.tar.gz"
-            )
-            .as_deref(),
-            Some("pkg:github/owner/project@v1.2.3")
-        );
-    }
-
-    #[test]
-    fn infers_github_purl_from_codeload_archive() {
-        assert_eq!(
-            infer_github_release_purl(
-                "https://codeload.github.com/owner/project/tar.gz/refs/tags/v1.2.3"
-            )
-            .as_deref(),
-            Some("pkg:github/owner/project@v1.2.3")
-        );
-    }
-
-    #[test]
-    fn infers_versioned_github_git_purl_from_tag() {
-        let source = Source {
-            source_type: Some("git".to_string()),
-            url: Some("https://github.com/madler/zlib.git".to_string()),
-            tag: Some("v1.3.1".to_string()),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            infer_purl(&source).as_deref(),
-            Some("pkg:github/madler/zlib@v1.3.1")
-        );
-    }
-
-    #[test]
-    fn normalizes_exact_git_describe_version() {
-        assert_eq!(
-            normalize_git_version("v1.3.1-0-g51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf").as_deref(),
-            Some("v1.3.1")
-        );
-    }
-
-    #[test]
-    fn infers_cargo_purl_from_crate_archive() {
-        assert_eq!(
-            infer_cargo_crate_purl(
-                "https://static.crates.io/crates/aho-corasick/aho-corasick-1.1.4.crate"
-            )
-            .as_deref(),
-            Some("pkg:cargo/aho-corasick@1.1.4")
-        );
-    }
-
-    #[test]
-    fn infers_nuget_purl_from_flat_container_url() {
-        assert_eq!(
-            infer_nuget_purl(
-                "https://api.nuget.org/v3-flatcontainer/avalonia/12.0.4/avalonia.12.0.4.nupkg"
-            )
-            .as_deref(),
-            Some("pkg:nuget/avalonia@12.0.4")
-        );
-    }
-
-    #[test]
-    fn infers_go_purl_from_proxy_zip_url() {
-        assert_eq!(
-            infer_go_proxy_purl(
-                "https://proxy.golang.org/github.com/!karpeles!lab/weak/@v/v0.1.1.zip"
-            )
-            .as_deref(),
-            Some("pkg:golang/github.com/KarpelesLab/weak@v0.1.1")
-        );
     }
 }
