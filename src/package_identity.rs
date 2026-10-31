@@ -64,15 +64,11 @@ pub fn infer(source: &Source) -> Option<String> {
                 return None;
             }
             let module = decode_go_module(&module.join("/"))?;
+            let version = decode_go_module(version_file.strip_suffix(".zip")?)?;
             let (namespace, name) = module
                 .rsplit_once('/')
                 .map_or((None, module.as_str()), |(ns, name)| (Some(ns), name));
-            purl(
-                "golang",
-                namespace,
-                name,
-                Some(version_file.strip_suffix(".zip")?),
-            )
+            purl("golang", namespace, name, Some(&version))
         }
         _ => None,
     }
@@ -234,6 +230,31 @@ fn decode_go_module(module: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_go_proxy_versions_and_rejects_invalid_escapes() {
+        for (version, expected) in [
+            ("v1.0.0-!r!c1", Some("v1.0.0-RC1")),
+            ("v1.0.0", Some("v1.0.0")),
+            ("v1.0.0-!", None),
+            ("v1.0.0-!1", None),
+        ] {
+            let source = Source {
+                url: Some(format!(
+                    "https://proxy.golang.org/example.com/module/@v/{version}.zip"
+                )),
+                ..Default::default()
+            };
+            let inferred = infer(&source);
+            let package = inferred
+                .as_deref()
+                .map(|value| value.parse::<PackageUrl>().unwrap());
+            assert_eq!(
+                package.as_ref().and_then(|package| package.version()),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn retains_source_archive_and_semver_identity_rules() {
