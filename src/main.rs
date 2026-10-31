@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::io::Write;
 use std::path::PathBuf;
-use tracing_subscriber::EnvFilter;
 
 mod content;
 mod coverage;
@@ -17,6 +16,7 @@ mod metadata;
 mod native;
 mod ostree;
 mod osv;
+mod package_identity;
 mod refname;
 mod sbom;
 
@@ -96,8 +96,8 @@ struct ScanArgs {
     repo: String,
 
     /// Vulnerability scanner backend.
-    #[arg(long, default_value = "grype")]
-    scanner: Scanner,
+    #[arg(long, default_value = "grype", value_parser = ["grype"])]
+    scanner: String,
 
     /// Scanner output format.
     #[arg(long, default_value = "json")]
@@ -119,11 +119,6 @@ struct ScanArgs {
     osv_endpoint: String,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
-enum Scanner {
-    Grype,
-}
-
 #[derive(Debug, Parser)]
 struct ReportArgs {
     /// Grype JSON output to summarize with Flatpak scope information.
@@ -137,11 +132,6 @@ struct CoverageArgs {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
     let reader = ostree::CliOstreeFileReader::new();
 
@@ -216,7 +206,7 @@ fn generate(
 
 fn default_output_path(app_ref: &str) -> PathBuf {
     refname::FlatpakRef::parse(app_ref)
-        .map(|flatpak_ref| PathBuf::from(format!("{}.cdx.json", flatpak_ref.id)))
+        .map(|flatpak_ref| PathBuf::from(format!("{}.cdx.json", flatpak_ref.id())))
         .unwrap_or_else(|_| PathBuf::from("flatpak-sbom.cdx.json"))
 }
 
@@ -227,113 +217,54 @@ fn scan(
     if (args.osv_commits || args.osv_packages) && args.format != "json" {
         anyhow::bail!("OSV scanning requires --format json");
     }
-    match args.scanner {
-        Scanner::Grype => {
-            let mut document = inventory(reader, &args.repo, &args.app_ref, &args.inventory)?;
-            make_grype_compatible(&mut document);
-            let json = serde_json::to_vec_pretty(&grype_input(&document)?)
-                .context("serialize CycloneDX document")?;
-            let tempdir = tempfile::tempdir().context("create temporary scan directory")?;
-            let sbom_path = tempdir.path().join("flatpak-sbom.cdx.json");
-            std::fs::write(&sbom_path, json).context("write temporary CycloneDX document")?;
-            let output = grype::run_grype(&sbom_path, &args.format)?;
-            if args.format == "json" {
-                let mut findings: serde_json::Value =
-                    serde_json::from_str(&output).context("parse scanner JSON output")?;
-                findings
-                    .get("matches")
-                    .and_then(serde_json::Value::as_array)
-                    .context("scanner JSON output has no matches array")?;
-                let coverage = coverage::summarize(&serde_json::to_value(&document)?)?;
-                findings
-                    .as_object_mut()
-                    .context("scanner JSON output is not an object")?
-                    .insert("flatpakCoverage".into(), serde_json::to_value(coverage)?);
-                let reviews: Vec<_> = document
-                    .components
-                    .iter()
-                    .filter(|c| content::is_quarantined(c))
-                    .collect();
-                findings.as_object_mut().unwrap().insert(
-                    "flatpakIdentityReviews".into(),
-                    serde_json::to_value(reviews)?,
-                );
-                if args.osv_commits {
-                    findings.as_object_mut().unwrap().insert(
-                        "flatpakOsv".into(),
-                        serde_json::to_value(osv::scan(
-                            &document,
-                            &args.osv_endpoint,
-                            osv::Mode::Commits,
-                        )?)?,
-                    );
-                }
-                if args.osv_packages {
-                    findings.as_object_mut().unwrap().insert(
-                        "flatpakOsvPackages".into(),
-                        serde_json::to_value(osv::scan(
-                            &document,
-                            &args.osv_endpoint,
-                            osv::Mode::Packages,
-                        )?)?,
-                    );
-                }
-                println!("{}", serde_json::to_string_pretty(&findings)?);
-            } else {
-                print!("{output}");
-            }
-            Ok(())
+    let document = inventory(reader, &args.repo, &args.app_ref, &args.inventory)?;
+    let output = grype::scan(&document, &args.format)?;
+    if args.format == "json" {
+        let mut findings: serde_json::Value =
+            serde_json::from_str(&output).context("parse scanner JSON output")?;
+        findings
+            .get("matches")
+            .and_then(serde_json::Value::as_array)
+            .context("scanner JSON output has no matches array")?;
+        let coverage = coverage::summarize(&serde_json::to_value(&document)?)?;
+        findings
+            .as_object_mut()
+            .context("scanner JSON output is not an object")?
+            .insert("flatpakCoverage".into(), serde_json::to_value(coverage)?);
+        let reviews: Vec<_> = document
+            .components
+            .iter()
+            .filter(|c| content::is_quarantined(c))
+            .collect();
+        findings.as_object_mut().unwrap().insert(
+            "flatpakIdentityReviews".into(),
+            serde_json::to_value(reviews)?,
+        );
+        if args.osv_commits {
+            findings.as_object_mut().unwrap().insert(
+                "flatpakOsv".into(),
+                serde_json::to_value(osv::scan(
+                    &document,
+                    &args.osv_endpoint,
+                    osv::Mode::Commits,
+                )?)?,
+            );
         }
-    }
-}
-
-fn grype_input(document: &cyclonedx::Bom) -> Result<serde_json::Value> {
-    let rejected: std::collections::BTreeSet<_> = document
-        .components
-        .iter()
-        .filter(|c| content::is_quarantined(c))
-        .map(|c| c.bom_ref.as_str())
-        .collect();
-    let mut input = serde_json::to_value(document)?;
-    // Keep the original document for coverage and OSV skipped identities.
-    // Grype may infer CPEs from names, so omit quarantined records entirely
-    // from its projection and remove graph references to them.
-    let keep = |v: &serde_json::Value| !rejected.contains(v.as_str().unwrap_or_default());
-    input["components"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|c| keep(&c["bom-ref"]));
-    if let Some(dependencies) = input
-        .get_mut("dependencies")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        dependencies.retain(|d| keep(&d["ref"]));
-        for dependency in dependencies {
-            if let Some(refs) = dependency
-                .get_mut("dependsOn")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                refs.retain(&keep);
-            }
+        if args.osv_packages {
+            findings.as_object_mut().unwrap().insert(
+                "flatpakOsvPackages".into(),
+                serde_json::to_value(osv::scan(
+                    &document,
+                    &args.osv_endpoint,
+                    osv::Mode::Packages,
+                )?)?,
+            );
         }
+        println!("{}", serde_json::to_string_pretty(&findings)?);
+    } else {
+        print!("{output}");
     }
-    if let Some(compositions) = input
-        .get_mut("compositions")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        for composition in compositions {
-            if let Some(refs) = composition["assemblies"].as_array_mut() {
-                refs.retain(&keep);
-            }
-        }
-    }
-    Ok(input)
-}
-
-fn make_grype_compatible(document: &mut cyclonedx::Bom) {
-    // Grype/Syft v1.40 rejects CycloneDX 1.7 JSON, but accepts the fields we emit as 1.6.
-    document.schema = "https://cyclonedx.org/schema/bom-1.6.schema.json".to_string();
-    document.spec_version = "1.6".to_string();
+    Ok(())
 }
 
 fn inventory(
@@ -406,78 +337,10 @@ mod tests {
     }
 
     #[test]
-    fn grype_compatibility_downgrades_cyclonedx_version() {
-        let mut document = cyclonedx::Bom {
-            schema: "https://cyclonedx.org/schema/bom-1.7.schema.json".to_string(),
-            bom_format: "CycloneDX".to_string(),
-            spec_version: "1.7".to_string(),
-            serial_number: "urn:uuid:00000000-0000-0000-0000-000000000000".to_string(),
-            version: 1,
-            metadata: cyclonedx::Metadata {
-                timestamp: None,
-                lifecycles: vec![],
-                tools: None,
-                component: cyclonedx::Component {
-                    cpe: None,
-                    component_type: "application".to_string(),
-                    name: "test".to_string(),
-                    bom_ref: "test".to_string(),
-                    version: None,
-                    purl: None,
-                    external_references: vec![],
-                    hashes: vec![],
-                    licenses: vec![],
-                    evidence: None,
-                    properties: vec![],
-                },
-            },
-            components: vec![],
-            dependencies: vec![],
-            compositions: vec![],
-        };
-
-        make_grype_compatible(&mut document);
-        assert_eq!(
-            document.schema,
-            "https://cyclonedx.org/schema/bom-1.6.schema.json"
-        );
-        assert_eq!(document.spec_version, "1.6");
-
-        let mut rejected = document.metadata.component.clone();
-        rejected.bom_ref = "quarantined".into();
-        rejected.properties.push(cyclonedx::property(
-            "flatpak:identity-status",
-            "quarantined",
-        ));
-        document.components.push(rejected);
-        document.dependencies = vec![
-            cyclonedx::Dependency {
-                bom_ref: "test".into(),
-                depends_on: vec!["quarantined".into()],
-            },
-            cyclonedx::Dependency {
-                bom_ref: "quarantined".into(),
-                depends_on: vec![],
-            },
-        ];
-        document.compositions.push(cyclonedx::Composition {
-            aggregate: "incomplete".into(),
-            assemblies: vec!["test".into(), "quarantined".into()],
-        });
-        let input = grype_input(&document).unwrap();
-        assert_eq!(input["components"], serde_json::json!([]));
-        assert_eq!(
-            input["dependencies"],
-            serde_json::json!([{"ref":"test", "dependsOn":[]}])
-        );
-        assert_eq!(
-            input["compositions"][0]["assemblies"],
-            serde_json::json!(["test"])
-        );
-        assert_eq!(
-            document.components.len(),
-            1,
-            "original inventory evidence is retained"
-        );
+    fn scanner_option_remains_compatible_without_dispatch() {
+        let args = ["flatpak-sbom", "scan", "app/org.example.App/x86_64/stable"];
+        assert!(Cli::try_parse_from(args).is_ok());
+        assert!(Cli::try_parse_from(args.into_iter().chain(["--scanner", "grype"])).is_ok());
+        assert!(Cli::try_parse_from(args.into_iter().chain(["--scanner", "unknown"])).is_err());
     }
 }

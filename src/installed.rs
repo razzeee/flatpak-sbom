@@ -1,5 +1,5 @@
 //! Pin installed deployment directories before reading manifests or contents.
-use crate::ostree::OstreeFileReader;
+use crate::ostree::{OstreeFileReader, RepositorySnapshot};
 use anyhow::{bail, Context, Result};
 use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, process::Command};
 
@@ -57,28 +57,32 @@ impl InstalledReader {
 }
 
 impl OstreeFileReader for InstalledReader {
-    fn resolve_ref(&self, _repo: &str, reference: &str) -> Result<String> {
-        Ok(deployment_commit(&self.deployment(reference)?)?.to_owned())
-    }
-
-    fn read_file_from_ref(
+    fn read_snapshot(
         &self,
         _repo: &str,
         reference: &str,
-        path: &str,
-    ) -> Result<Option<Vec<u8>>> {
-        // Callers request only these fixed paths; do not allow escaping a deployment.
-        if !matches!(
-            path,
-            "metadata" | "files/manifest.json" | "usr/manifest.json"
-        ) {
-            bail!("unsupported deployment metadata path {path}");
+        paths: &[&str],
+    ) -> Result<RepositorySnapshot> {
+        let deployment = self.deployment(reference)?;
+        let commit = deployment_commit(&deployment)?.to_owned();
+        let mut files = BTreeMap::new();
+        for path in paths {
+            // Callers request only these fixed paths; do not allow escaping a deployment.
+            if !matches!(
+                *path,
+                "metadata" | "files/manifest.json" | "usr/manifest.json"
+            ) {
+                bail!("unsupported deployment metadata path {path}");
+            }
+            match std::fs::read(deployment.join(path)) {
+                Ok(bytes) => {
+                    files.insert((*path).to_string(), bytes);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("read installed deployment metadata"),
+            }
         }
-        match std::fs::read(self.deployment(reference)?.join(path)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).context("read installed deployment metadata"),
-        }
+        Ok(RepositorySnapshot { commit, files })
     }
 }
 

@@ -6,13 +6,19 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 pub trait OstreeFileReader {
-    fn read_file_from_ref(
+    /// Resolve once and read only the requested paths from that immutable commit.
+    /// Missing paths are omitted; transport and repository failures are errors.
+    fn read_snapshot(
         &self,
         repo_url: &str,
         ref_name: &str,
-        path: &str,
-    ) -> Result<Option<Vec<u8>>>;
-    fn resolve_ref(&self, repo_url: &str, ref_name: &str) -> Result<String>;
+        paths: &[&str],
+    ) -> Result<RepositorySnapshot>;
+}
+
+pub struct RepositorySnapshot {
+    pub commit: String,
+    pub files: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Debug, Default)]
@@ -31,7 +37,6 @@ struct CachedRepo {
     _tempdir: TempDir,
     repo_url: String,
     path: PathBuf,
-    commits: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -51,6 +56,7 @@ struct ProcessOstreeCommands;
 impl OstreeCommands for ProcessOstreeCommands {
     fn output(&self, args: &[String]) -> Result<OstreeOutput> {
         let output = Command::new("ostree")
+            .env("LC_ALL", "C")
             .args(args)
             .output()
             .context("run ostree command")?;
@@ -123,7 +129,6 @@ impl RepositorySession {
             _tempdir: tempdir,
             repo_url: repo_url.to_string(),
             path: repo.clone(),
-            commits: BTreeMap::new(),
         });
 
         Ok(repo)
@@ -135,8 +140,6 @@ impl RepositorySession {
             format!("--repo={}", repo.display()),
             "pull".to_string(),
             "--depth=0".to_string(),
-            // Identify the application consistently for discovery, metadata,
-            // and content. Some repositories reject libostree's generic UA.
             format!(
                 "--http-header=User-Agent=flatpak-sbom/{}",
                 env!("CARGO_PKG_VERSION")
@@ -147,6 +150,7 @@ impl RepositorySession {
         } else {
             args.push("--commit-metadata-only".to_string());
         }
+        args.push("--disable-static-deltas".to_string());
         args.push("origin".to_string());
         args.push(ref_name.to_string());
         self.run(args)?;
@@ -160,22 +164,13 @@ impl RepositorySession {
         ref_name: &str,
         path: &str,
     ) -> Result<Option<Vec<u8>>> {
-        self.ensure_repo(repo_url)?;
-        let pinned = self
-            .repo
-            .lock()
-            .expect("OSTree repo cache poisoned")
-            .as_ref()
-            .and_then(|repo| repo.commits.get(ref_name))
-            .cloned();
-        let revision = pinned.as_deref().unwrap_or(ref_name);
-        let repo = self.pull_ref(repo_url, revision, Some(path))?;
+        let repo = self.pull_ref(repo_url, ref_name, Some(path))?;
         let normalized = path.trim_start_matches('/');
         let output = self.output(
             vec![
                 format!("--repo={}", repo.display()),
                 "cat".to_string(),
-                pinned.unwrap_or_else(|| format!("origin:{ref_name}")),
+                ref_name.to_string(),
                 format!("/{normalized}"),
             ],
             "run ostree cat",
@@ -217,13 +212,6 @@ impl RepositorySession {
         if commit.len() != 64 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("ostree returned an invalid commit checksum");
         }
-        self.repo
-            .lock()
-            .expect("OSTree repo cache poisoned")
-            .as_mut()
-            .expect("repository initialized")
-            .commits
-            .insert(ref_name.to_string(), commit.clone());
         Ok(commit)
     }
 }
@@ -241,6 +229,24 @@ impl CliOstreeFileReader {
     }
 }
 
+impl OstreeFileReader for CliOstreeFileReader {
+    fn read_snapshot(
+        &self,
+        repo_url: &str,
+        ref_name: &str,
+        paths: &[&str],
+    ) -> Result<RepositorySnapshot> {
+        let commit = self.session.resolve_ref(repo_url, ref_name)?;
+        let mut files = BTreeMap::new();
+        for path in paths {
+            if let Some(bytes) = self.session.read_file_from_ref(repo_url, &commit, path)? {
+                files.insert((*path).to_string(), bytes);
+            }
+        }
+        Ok(RepositorySnapshot { commit, files })
+    }
+}
+
 impl crate::content::ContentSource for CliOstreeFileReader {
     fn content_tree(
         &self,
@@ -251,8 +257,6 @@ impl crate::content::ContentSource for CliOstreeFileReader {
         if commit.len() != 64 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("invalid content checkout commit checksum");
         }
-        // Pull and check out the recorded checksum, never a moving ref. Keep
-        // ownership local and copy files so scanners cannot modify repo objects.
         let repo = self.session.pull_ref(repo_url, commit, Some("files"))?;
         let directory = tempfile::tempdir().context("create content checkout directory")?;
         let tree = crate::content::ContentTree::checkout(directory);
@@ -269,21 +273,6 @@ impl crate::content::ContentSource for CliOstreeFileReader {
     }
     fn content_origin(&self) -> &'static str {
         "ostree-checkout"
-    }
-}
-
-impl OstreeFileReader for CliOstreeFileReader {
-    fn read_file_from_ref(
-        &self,
-        repo_url: &str,
-        ref_name: &str,
-        path: &str,
-    ) -> Result<Option<Vec<u8>>> {
-        self.session.read_file_from_ref(repo_url, ref_name, path)
-    }
-
-    fn resolve_ref(&self, repo_url: &str, ref_name: &str) -> Result<String> {
-        self.session.resolve_ref(repo_url, ref_name)
     }
 }
 
@@ -339,64 +328,31 @@ mod tests {
     }
 
     #[test]
-    fn reuses_cached_repo_for_same_remote() {
-        let commands = RecordingCommands::with_outputs(vec![
-            success(vec![]),
-            success(vec![]),
-            success(vec![]),
-            success(b"first".to_vec()),
-            success(vec![]),
-            success(b"second".to_vec()),
-        ]);
-        let reader = CliOstreeFileReader::with_commands(commands.clone());
-
-        reader
-            .read_file_from_ref(
-                "https://repo.test",
-                "app/org.example.App/x86_64/stable",
-                "metadata",
-            )
-            .unwrap();
-        reader
-            .read_file_from_ref(
-                "https://repo.test",
-                "app/org.example.App/x86_64/stable",
-                "files/manifest.json",
-            )
-            .unwrap();
-
-        let calls = commands.calls();
-        assert_eq!(calls.iter().filter(|call| call[1] == "init").count(), 1);
-        assert_eq!(calls.iter().filter(|call| call[1] == "remote").count(), 1);
-        assert_eq!(calls.iter().filter(|call| call[1] == "pull").count(), 2);
-    }
-
-    #[test]
     fn switches_repo_when_remote_changes() {
         let commands = RecordingCommands::with_outputs(vec![
             success(vec![]),
             success(vec![]),
             success(vec![]),
-            success(b"one".to_vec()),
+            success("a".repeat(64).into_bytes()),
             success(vec![]),
             success(vec![]),
             success(vec![]),
-            success(b"two".to_vec()),
+            success("b".repeat(64).into_bytes()),
         ]);
         let reader = CliOstreeFileReader::with_commands(commands.clone());
 
         reader
-            .read_file_from_ref(
+            .read_snapshot(
                 "https://repo-one.test",
                 "app/org.example.App/x86_64/stable",
-                "metadata",
+                &[],
             )
             .unwrap();
         reader
-            .read_file_from_ref(
+            .read_snapshot(
                 "https://repo-two.test",
                 "app/org.example.App/x86_64/stable",
-                "metadata",
+                &[],
             )
             .unwrap();
 
@@ -411,152 +367,139 @@ mod tests {
     }
 
     #[test]
-    fn pulls_requested_file_subpath_before_cat() {
-        let commands = RecordingCommands::with_outputs(vec![
-            success(vec![]),
-            success(vec![]),
-            success(vec![]),
-            success(b"contents".to_vec()),
-        ]);
-        let reader = CliOstreeFileReader::with_commands(commands.clone());
-
-        reader
-            .read_file_from_ref(
-                "https://repo.test",
-                "app/org.example.App/x86_64/stable",
-                "/files/manifest.json",
-            )
-            .unwrap();
-
-        let calls = commands.calls();
-        let pull = calls.iter().find(|call| call[1] == "pull").unwrap();
-        assert!(pull.contains(&"--subpath=/files/manifest.json".to_string()));
-        let cat = calls.iter().find(|call| call[1] == "cat").unwrap();
-        assert_eq!(cat.last().map(String::as_str), Some("/files/manifest.json"));
-    }
-
-    #[test]
-    fn maps_missing_file_stderr_to_none() {
-        let commands = RecordingCommands::with_outputs(vec![
-            success(vec![]),
-            success(vec![]),
-            success(vec![]),
-            failure(b"error: No such file or directory".to_vec()),
-        ]);
-        let reader = CliOstreeFileReader::with_commands(commands);
-
-        let data = reader
-            .read_file_from_ref(
-                "https://repo.test",
-                "app/org.example.App/x86_64/stable",
-                "metadata",
-            )
-            .unwrap();
-
-        assert!(data.is_none());
-    }
-
-    #[test]
     fn includes_failed_command_stderr_in_error() {
         let commands =
             RecordingCommands::with_outputs(vec![failure(b"network unavailable".to_vec())]);
         let reader = CliOstreeFileReader::with_commands(commands);
 
         let err = reader
-            .resolve_ref("https://repo.test", "app/org.example.App/x86_64/stable")
-            .unwrap_err();
+            .read_snapshot(
+                "https://repo.test",
+                "app/org.example.App/x86_64/stable",
+                &["metadata"],
+            )
+            .err()
+            .unwrap();
 
         assert!(err.to_string().contains("network unavailable"));
     }
 
     #[test]
-    fn reads_pinned_commit_after_resolution_without_pulling_full_tree() {
-        let commit = "a".repeat(64);
+    fn snapshot_reads_stay_on_resolved_commit() {
         let commands = RecordingCommands::with_outputs(vec![
             success(vec![]),
             success(vec![]),
             success(vec![]),
-            success(commit.as_bytes()),
+            success(format!("{}\n", "a".repeat(64)).into_bytes()),
             success(vec![]),
-            success(b"old manifest"),
+            success(b"metadata".to_vec()),
+            success(vec![]),
+            success(b"manifest".to_vec()),
         ]);
         let reader = CliOstreeFileReader::with_commands(commands.clone());
-        let reference = "app/org.example.App/x86_64/stable";
-        assert_eq!(
-            reader.resolve_ref("https://repo.test", reference).unwrap(),
-            commit
-        );
-        reader
-            .read_file_from_ref("https://repo.test", reference, "files/manifest.json")
+        let snapshot = reader
+            .read_snapshot(
+                "https://repo.test",
+                "app/org.example.App/x86_64/stable",
+                &["metadata", "files/manifest.json"],
+            )
             .unwrap();
+        assert_eq!(snapshot.commit, "a".repeat(64));
+        assert_eq!(snapshot.files["metadata"], b"metadata");
         let calls = commands.calls();
-        assert!(calls[2].contains(&"--commit-metadata-only".to_string()));
-        assert_eq!(calls[4].last(), Some(&commit));
-        assert_eq!(calls[5][2], commit);
+        let pulls: Vec<_> = calls.iter().filter(|call| call[1] == "pull").collect();
+        assert!(pulls[0].contains(&"--commit-metadata-only".to_string()));
+        for pull in &pulls[1..] {
+            assert_eq!(pull.last().unwrap(), &snapshot.commit);
+            assert!(pull.iter().any(|arg| arg.starts_with("--subpath=")));
+            assert!(pull.contains(&"--disable-static-deltas".to_string()));
+        }
+        for cat in calls.iter().filter(|call| call[1] == "cat") {
+            assert_eq!(cat[2], snapshot.commit);
+        }
     }
 
     #[test]
-    #[ignore = "requires ostree; run in acceptance CI"]
-    fn real_repository_update_does_not_change_pinned_contents() {
-        use crate::content::ContentSource;
+    fn reads_real_repository_without_fetching_unrequested_payloads() {
         let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("remote");
+        let remote = temp.path().join("remote");
         let tree = temp.path().join("tree");
-        std::fs::create_dir(&tree).unwrap();
+        std::fs::create_dir_all(tree.join("files")).unwrap();
+        std::fs::write(tree.join("metadata"), b"old metadata").unwrap();
+        std::fs::write(tree.join("files/manifest.json"), b"{}").unwrap();
+        std::fs::write(tree.join("files/payload"), b"unrequested payload").unwrap();
         let run = |args: &[&str]| {
             let output = Command::new("ostree")
-                .arg(format!("--repo={}", repo.display()))
+                .arg(format!("--repo={}", remote.display()))
                 .args(args)
                 .output()
-                .unwrap();
+                .expect("install ostree to run repository tests");
             assert!(
                 output.status.success(),
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
         };
         run(&["init", "--mode=archive"]);
-        let reference = "app/org.example.App/x86_64/stable";
-        let commit = || {
-            run(&[
-                "commit",
-                &format!("--branch={reference}"),
-                &format!("--tree=dir={}", tree.display()),
-                "--subject=fixture",
-            ])
-        };
-        std::fs::write(tree.join("metadata"), "old").unwrap();
-        std::fs::create_dir(tree.join("files")).unwrap();
-        std::fs::write(tree.join("files/dependency.txt"), "old package").unwrap();
-        commit();
+        let ref_name = "app/org.example.App/x86_64/stable";
+        let commit = run(&[
+            "commit",
+            "--branch",
+            ref_name,
+            "--subject",
+            "initial",
+            &format!("--tree=dir={}", tree.display()),
+        ]);
+        let repo_url = format!("file://{}", remote.display());
         let reader = CliOstreeFileReader::new();
-        let url = format!("file://{}", repo.display());
-        let checksum = reader.resolve_ref(&url, reference).unwrap();
-        std::fs::write(tree.join("metadata"), "new").unwrap();
-        std::fs::write(tree.join("files/dependency.txt"), "new package").unwrap();
-        commit();
+        let snapshot = reader
+            .read_snapshot(
+                &repo_url,
+                ref_name,
+                &["metadata", "files/manifest.json", "usr/manifest.json"],
+            )
+            .unwrap();
+        assert_eq!(snapshot.commit, commit);
+        assert_eq!(snapshot.files["metadata"], b"old metadata");
+        assert_eq!(snapshot.files["files/manifest.json"], b"{}");
+        assert!(!snapshot.files.contains_key("usr/manifest.json"));
+        // Inspect the real destination repository: the payload object must not be present.
+        let cache = reader.session.repo.lock().unwrap();
+        let output = Command::new("ostree")
+            .arg(format!("--repo={}", cache.as_ref().unwrap().path.display()))
+            .args(["cat", &commit, "/files/payload"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        drop(cache);
+
+        std::fs::write(tree.join("metadata"), b"new metadata").unwrap();
+        std::fs::write(tree.join("files/payload"), b"new payload").unwrap();
+        let new_commit = run(&[
+            "commit",
+            "--branch",
+            ref_name,
+            "--subject",
+            "updated",
+            &format!("--tree=dir={}", tree.display()),
+        ]);
+        let updated = reader
+            .read_snapshot(&repo_url, ref_name, &["metadata"])
+            .unwrap();
+        assert_eq!(updated.commit, new_commit);
+        assert_eq!(updated.files["metadata"], b"new metadata");
+        assert_eq!(snapshot.files["metadata"], b"old metadata");
+        use crate::content::ContentSource;
+        let checkout = reader
+            .content_tree(&repo_url, ref_name, &snapshot.commit)
+            .unwrap();
         assert_eq!(
-            reader
-                .read_file_from_ref(&url, reference, "metadata")
-                .unwrap(),
-            Some(b"old".to_vec())
-        );
-        assert_eq!(
-            reader
-                .read_file_from_ref(&url, reference, "absent")
-                .unwrap(),
-            None
-        );
-        let checkout = reader.content_tree(&url, reference, &checksum).unwrap();
-        assert_eq!(
-            std::fs::read(checkout.path.join("dependency.txt")).unwrap(),
-            b"old package"
+            std::fs::read(checkout.path.join("payload")).unwrap(),
+            b"unrequested payload"
         );
         let checkout_path = checkout.path.clone();
         drop(checkout);
-        assert!(
-            !checkout_path.exists(),
-            "temporary content must be removed after scanning"
-        );
+        assert!(!checkout_path.exists());
     }
 }
