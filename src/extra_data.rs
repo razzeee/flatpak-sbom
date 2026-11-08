@@ -180,7 +180,11 @@ fn download_and_unpack(
         hash.update(&buffer[..count]);
         archive.write_all(&buffer[..count])?;
     }
-    let checksum = format!("{:x}", hash.finalize());
+    let checksum: String = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     if checksum != source.sha256.to_ascii_lowercase() {
         bail!("extra-data SHA-256 mismatch");
     }
@@ -437,7 +441,7 @@ fn unpack(
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i)?;
             extraction.entry()?;
-            let name = PathBuf::from(entry.name());
+            let name = PathBuf::from(entry.name().context("decode zip entry name")?.as_ref());
             let target = safe_path(root, &name)?;
             if entry.is_symlink() {
                 extraction.links += 1;
@@ -486,6 +490,29 @@ fn metadata_header(name: Vec<u8>, size: u64) -> ar::Header {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_zip_entry_names_that_escape_the_extraction_root() {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("package.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"hello").unwrap();
+        let mut bytes = zip.finish().unwrap().into_inner();
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        bytes[30..42].copy_from_slice(b"../escape.js");
+        bytes[central + 46..central + 58].copy_from_slice(b"../escape.js");
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("payload.zip");
+        let root = dir.path().join("files");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&payload, bytes).unwrap();
+        assert!(unpack(&payload, &root, &mut Extraction::default(), 0).is_err());
+        assert!(!dir.path().join("escape.js").exists());
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+    }
 
     #[test]
     fn squashfs_extracts_files_skips_links_and_enforces_bounds() {
