@@ -8,8 +8,11 @@ passed Rust formatting, Clippy, tests, repository consistency, CycloneDX schemas
 and the pinned Syft/Grype acceptance gates at commit
 `8286b67edcde2274fc4cf904811ffbe80e93c673`. Its live Flathub gate was skipped.
 The [full live release gate](https://github.com/razzeee/flatpak-sbom/actions/runs/42632307818)
-was dispatched with full remote-content scanning for that commit. Consult its
-result and preserved evidence before publication; dispatch alone is not a pass.
+also passed for that commit with `live_content=true`: Calculator, KCalc, Element
+and Spotify remote-content generation completed with Syft and official schema
+validation. Generated documents are preserved in its `live-flathub-sboms`
+artifact. This tests remote content delivery and inventory generation, not
+complete extra-data acquisition or absence of vulnerabilities.
 The release workflow reruns all gates at the tagged commit before publishing.
 
 Passing CI is no longer outstanding. References below to unobserved CI describe
@@ -23,8 +26,8 @@ queries in 20.08 seconds using batching and shared advisory-detail caching.
 Live Flathub fetching now passes after identifying requests with the application's
 User-Agent. The known Syft FFmpeg ABI-as-release error is now quarantined with
 preserved evidence. Automatic installed extension discovery and checksum-verified
-remote extra-data acquisition are implemented and locally verified. A passing
-live Flathub release gate remains required before publication.
+remote extra-data acquisition are implemented and locally verified. All release
+gates must pass again at the tagged commit before publication.
 Local acceptance evidence alone does not establish production readiness.
 
 The manifest-derived generator has executable local acceptance coverage. Optional
