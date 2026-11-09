@@ -2,6 +2,9 @@
 name = "flatpak-sbom"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Generate CycloneDX SBOMs and scoped vulnerability reports for Flatpak apps"
+repository = "https://github.com/razzeee/flatpak-sbom"
 
 [dependencies]
 anyhow = "1.0"

@@ -2,23 +2,39 @@
 
 ## Release decision
 
-**Not production-ready yet.** The full installed-Chrome scan timeout is resolved:
+**Initial release scope: incomplete inventories, not security attestations.**
+The [2026-11-09 CI run](https://github.com/razzeee/flatpak-sbom/actions/runs/42629152261)
+passed Rust formatting, Clippy, tests, repository consistency, CycloneDX schemas
+and the pinned Syft/Grype acceptance gates at commit
+`8286b67edcde2274fc4cf904811ffbe80e93c673`. Its live Flathub gate was skipped.
+The [full live release gate](https://github.com/razzeee/flatpak-sbom/actions/runs/42632307818)
+also passed for that commit with `live_content=true`: Calculator, KCalc, Element
+and Spotify remote-content generation completed with Syft and official schema
+validation. Generated documents are preserved in its `live-flathub-sboms`
+artifact. This tests remote content delivery and inventory generation, not
+complete extra-data acquisition or absence of vulnerabilities.
+The release workflow reruns all gates at the tagged commit before publishing.
+
+Passing CI is no longer outstanding. References below to unobserved CI describe
+the historical verification dates, not the current CI state. Complete inventories
+of stripped, static and vendored dependencies remain unsupported and are not
+promised by the initial release. Local evidence alone is not a release gate.
+
+The full installed-Chrome scan timeout is resolved:
 the release binary completed inventory, Grype and 1,263 OSV package-identity
 queries in 20.08 seconds using batching and shared advisory-detail caching.
 Live Flathub fetching now passes after identifying requests with the application's
 User-Agent. The known Syft FFmpeg ABI-as-release error is now quarantined with
 preserved evidence. Automatic installed extension discovery and checksum-verified
-remote extra-data acquisition are implemented and locally verified. A passing
-GitHub Actions run and complete stripped/vendored dependency inventories remain
-outstanding.
+remote extra-data acquisition are implemented and locally verified. All release
+gates must pass again at the tagged commit before publication.
 Local acceptance evidence alone does not establish production readiness.
 
 The manifest-derived generator has executable local acceptance coverage. Optional
 installed/remote-content scanning and security-specific gates are documented in
 [SECURITY-COVERAGE.md](SECURITY-COVERAGE.md). A
-production release remains gated on the CI acceptance job. The local live
-Flathub gate now passes; GitHub Actions has not yet been observed passing for
-these changes.
+release remains gated on the CI acceptance and live Flathub jobs. The local live
+Flathub gate passed on the dates recorded below; current CI evidence is above.
 
 The default scope is an inventory of source declarations. Optional content mode
 adds detected packages from installed files and ASAR metadata, but does not
