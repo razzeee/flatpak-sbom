@@ -503,7 +503,39 @@ fn collect_files(root: &Path, paths: &mut Vec<std::path::PathBuf>) -> Result<()>
     Ok(())
 }
 
+fn bundled_extension_manifest(location: &str) -> bool {
+    let logical_path = if let Some((archive, member)) = location.split_once("!/") {
+        let Some(parent) = archive.strip_suffix("/app.asar") else {
+            return false;
+        };
+        format!("{parent}/app/{member}")
+    } else {
+        location.to_string()
+    };
+    let parts: Vec<_> = logical_path.trim_start_matches('/').split('/').collect();
+    // Extension metadata can also occur in published npm packages. Only correct
+    // direct bundled-extension manifests, never an extension's npm dependencies.
+    if parts
+        .iter()
+        .any(|part| matches!(*part, "" | "." | ".." | "node_modules"))
+    {
+        return false;
+    }
+    matches!(
+        parts.as_slice(),
+        [.., "resources", "app", "extensions", _, "package.json"]
+    )
+}
+
 fn correct_extension(package: &mut Value, manifest: &Value) -> Result<()> {
+    let is_extension = package["locations"]
+        .as_array()
+        .filter(|locations| locations.len() == 1)
+        .and_then(|locations| locations[0]["path"].as_str())
+        .is_some_and(bundled_extension_manifest);
+    if !is_extension {
+        return Ok(());
+    }
     let Some(publisher) = manifest["publisher"].as_str().filter(|s| !s.is_empty()) else {
         return Ok(());
     };
@@ -543,6 +575,9 @@ fn correct_installed_extension(package: &mut Value, root: &Path, files: &[PathBu
     let Some(location) = locations[0]["path"].as_str() else {
         return Ok(());
     };
+    if !bundled_extension_manifest(location) {
+        return Ok(());
+    }
     let relative = Path::new(location.trim_start_matches('/'));
     if relative
         .file_name()
@@ -746,6 +781,22 @@ mod tests {
         assert_eq!(package["locations"], original["locations"]);
         assert_eq!(package["version"], original["version"]);
 
+        for relative in [
+            "share/codium/resources/app/node_modules/markdown/package.json",
+            "share/codium/resources/app/extensions/markdown-basics/node_modules/markdown/package.json",
+            "node_modules/editor/resources/app/extensions/markdown/package.json",
+            "project/extensions/markdown/package.json",
+        ] {
+            let path = directory.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, extension_manifest().to_string()).unwrap();
+            let mut package = original.clone();
+            package["locations"][0]["path"] = Value::String(format!("/{relative}"));
+            let before = package.clone();
+            correct_installed_extension(&mut package, directory.path(), &[path]).unwrap();
+            assert_eq!(package, before, "npm identity must survive at {relative}");
+        }
+
         for location in [
             "../package.json",
             "share/../package.json",
@@ -766,7 +817,10 @@ mod tests {
         let manifest = serde_json::to_vec(&extension_manifest()).unwrap();
         let header = serde_json::to_vec(&serde_json::json!({"files": {
             "extensions":{"files":{"markdown-basics":{"files":{
-                "package.json":{"offset":"0", "size":manifest.len()}
+                "package.json":{"offset":"0", "size":manifest.len()},
+                "node_modules":{"files":{"markdown":{"files":{
+                    "package.json":{"offset":"0", "size":manifest.len()}
+                }}}}
             }}}}
         }}))
         .unwrap();
@@ -780,17 +834,42 @@ mod tests {
         bytes.extend(vec![0; padding]);
         bytes.extend(manifest);
         std::fs::write(&path, bytes).unwrap();
-        let packages = asar_packages(&path, "app.asar").unwrap();
-        assert_eq!(packages.len(), 1);
+        let packages = asar_packages(&path, "share/codium/resources/app.asar").unwrap();
+        assert_eq!(packages.len(), 2);
+        let dependency = packages
+            .iter()
+            .find(|p| {
+                p["locations"][0]["path"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/node_modules/")
+            })
+            .unwrap();
+        assert_eq!(dependency["purl"], "pkg:npm/markdown@30.0.0");
+        assert_eq!(dependency["type"], "npm");
+        assert!(dependency.get("identityCorrection").is_none());
+        let extension = packages
+            .iter()
+            .find(|p| p["type"] == "vscode-extension")
+            .unwrap();
         assert_eq!(
-            packages[0]["purl"],
+            extension["purl"],
             "pkg:generic/vscode-extension/vscode.markdown@30.0.0"
         );
-        assert_eq!(packages[0]["type"], "vscode-extension");
         assert_eq!(
-            packages[0]["locations"][0]["path"],
-            "app.asar!/extensions/markdown-basics/package.json"
+            extension["locations"][0]["path"],
+            "share/codium/resources/app.asar!/extensions/markdown-basics/package.json"
         );
+        for archive in [
+            "app.asar",
+            "share/codium/resources/node_modules.asar",
+            "node_modules/editor/resources/app.asar",
+        ] {
+            for package in asar_packages(&path, archive).unwrap() {
+                assert_eq!(package["purl"], "pkg:npm/markdown@30.0.0", "{archive}");
+                assert!(package.get("identityCorrection").is_none());
+            }
+        }
     }
 
     #[test]
