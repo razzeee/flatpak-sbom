@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      live_content:
+        description: Also download and scan full Flathub app/runtime contents
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
       live_content:
@@ -90,14 +96,14 @@ jobs:
           GRYPE_DB_AUTO_UPDATE: 'false'
         run: .venv/bin/python tests/acceptance.py
       - name: Live Flathub release gate
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           TEST_FLATHUB: '1'
           TEST_FLATHUB_CONTENT: ${{ inputs.live_content && '1' || '0' }}
           ACCEPTANCE_TIMEOUT: '600'
         run: .venv/bin/python tests/acceptance.py
       - name: Preserve live SBOM evidence
-        if: always() && github.event_name == 'workflow_dispatch'
+        if: always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
         uses: actions/upload-artifact@v7
         with:
           name: live-flathub-sboms

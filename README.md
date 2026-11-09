@@ -23,6 +23,10 @@ The default remote is `https://dl.flathub.org/repo`; pass `--repo` to use anothe
 ## Installation and operation
 
 Build with `cargo build --release --locked`, or install with `cargo install --path . --locked`.
+Tagged [GitHub releases](https://github.com/razzeee/flatpak-sbom/releases) provide
+Linux x86_64 and aarch64 archives plus `SHA256SUMS`. These binaries are built on
+Ubuntu 24.04 and require glibc 2.39 or newer. Verify the downloaded archives with
+`sha256sum --check --ignore-missing SHA256SUMS` before extracting them.
 Linux with `ostree` on `PATH` is required. `scan` additionally requires Grype;
 the acceptance suite tests Grype 0.121.0. `report` requires no external tools.
 Installed input requires `flatpak`; content scanning additionally requires Syft
@@ -321,3 +325,13 @@ covers GNOME, KDE, Electron, and extra-data apps and records generated documents
 under `target/acceptance`. See [READINESS.md](READINESS.md) for the current evidence
 and outstanding release gate. To validate existing SBOMs, set `SBOM_CORPUS` to a
 directory of JSON documents when running the acceptance script.
+
+The release workflow runs the Rust, scanner and full live Flathub gates on
+version tags before publishing Linux archives and checksums. The tag must match
+the version in `Cargo.toml` and have release notes in `releases/<tag>.md`.
+
+## License
+
+flatpak-sbom is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE) for the
+license text. The bundled SCANOSS identity mapping retains its MIT license in
+[data/purl2cpe.LICENSE](data/purl2cpe.LICENSE); dependencies retain their own licenses.
